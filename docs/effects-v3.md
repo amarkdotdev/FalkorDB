@@ -401,20 +401,31 @@ case stays at or under v2's 340,001 bytes.
 
 ## Building a v3 payload
 
-`graph/src/runtime/effects_v3_emit.rs`, the mirror of `effects_v3_apply.rs`.
+`graph/src/runtime/effects_v3_emit.rs`, the mirror of `effects_v3_apply.rs` —
+and deliberately shaped like it:
+
+    emit    Pending  --digest-->  Record  --encode-->  bytes
+    apply   bytes    --decode-->  Record  --apply-->   Graph
+
+`Record` is the pivot both directions turn on. Digesting into it rather than
+writing bytes straight out of `Pending` costs nothing: the grouping already
+allocated the ids, labels, attribute ids and row values a `Record` holds, so
+they are moved into a value instead of passed as four loose slices. What it buys
+is a testable surface for the grouping — the emit tests assert on records rather
+than on decoded buffers — and a round-trip that compares values:
+`digest(pending) == read_buffer(encode(digest(pending)))`.
+
 The v2 emitter sits beside it in `effects_v2.rs`, whole and separate, so
 retiring the old format is deleting a file rather than untangling one. Neither
-lives in `pending.rs`: a mutation accumulator should not know what a
-replication frame looks like, and the wire format should not reach into
-query-execution state to find out what changed. `Pending` exposes one borrowed view per format —
-`effects_view_v3()` and `effects_view_v2()` — a narrow, explicit statement of
-what each depends on, rather than `pub(crate)` fields that widen by accident.
+lives in `pending.rs`: a mutation accumulator should not know what a replication
+frame looks like. `Pending`'s fields are `pub(crate)` and the wire knowledge
+lives in the emitters.
 
-They are separate structs even though v3's thirteen fields are a strict subset
-of v2's sixteen. Rust does not warn on an unused `pub` field, so a shared view
-would leave v2's three extras behind when `effects_v2.rs` goes, and any comment
-marking them v2-only would quietly become false. Thirteen duplicated
-declarations are the price of that not happening.
+An earlier revision put a per-format view struct between them. Those views were
+a pure projection — every field a reference to the same type in `Pending` — so
+they documented the dependency surface and did nothing else, while costing a
+struct and a constructor per format. `digest`'s return type states that surface
+better than a mirror of the source could.
 
 **The shapes are deliberately not pre-grouped inside `Pending`.** Attributes
 accumulate incrementally — `set_node_attribute` inserts into a sorted vec — so

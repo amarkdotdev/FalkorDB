@@ -1,53 +1,75 @@
-//! Turning a committed `Pending` into a v3 effects payload.
+//! Turning a committed `Pending` into v3 effect records.
 //!
-//! The mirror of `effects_v3_apply`. Keeping both out of `pending.rs` is the
-//! point: a mutation accumulator should not know what a replication frame looks
-//! like, and the wire format should not have to reach into query-execution
-//! state to find out what changed.
+//! The mirror of `effects_v3_apply`, and deliberately shaped like it:
+//!
+//! ```text
+//!   emit    Pending  --digest-->  Record  --encode-->  bytes
+//!   apply   bytes    --decode-->  Record  --apply-->   Graph
+//! ```
+//!
+//! `Record` is the pivot both directions turn on. Digesting into it rather than
+//! writing bytes straight out of `Pending` costs nothing — the grouping already
+//! allocated the ids, labels, attribute ids and row values that a `Record`
+//! holds — and it buys the grouping its own testable surface: the tests below
+//! assert on records, not on decoded buffers.
+//!
+//! Keeping this out of `pending.rs` is the other half. A mutation accumulator
+//! should not know what a replication frame looks like, so `Pending`'s fields
+//! are `pub(crate)` and the wire knowledge lives here.
 
-use crate::{
-    graph::graph::Graph,
-    runtime::{effects_v3 as v3, pending::EffectsViewV3, value::Value},
-};
 use atomic_refcell::AtomicRefCell;
 use roaring::RoaringTreemap;
 use rustc_hash::FxHashMap;
 
-/// Build a **v3** effects payload from what a query staged.
+use crate::{
+    graph::graph::Graph,
+    runtime::{
+        effects_v3::{self as v3, GraphEntity, Record, SchemaType},
+        pending::Pending,
+        value::Value,
+    },
+};
+
+/// Build a v3 effects payload from what a query staged.
 ///
-/// Lives here rather than on `Pending` so that `Pending` stays a mutation
-/// accumulator and knows nothing about the wire: it hands over a borrowed
-/// [`PendingEffects`] view and this module decides what the bytes look like.
-/// The apply path is the mirror of it, in `effects_v3_apply`.
-///
-/// The grouping is cheap because `Pending` already holds most of it:
-/// `created_nodes` is a `RoaringTreemap`, so ids arrive ascending for free;
-/// `created_rels_by_type` is already partitioned by relationship type; and the
-/// attribute vectors are already "sorted by id, unique", which is exactly the
-/// shape key.
-///
-/// The shapes are *not* pre-grouped inside `Pending`, deliberately. Attributes
-/// accumulate incrementally — `set_node_attribute` inserts into a sorted vec —
-/// so `CREATE (n) SET n.a=1 SET n.b=2` changes that node's shape twice, and
-/// pre-bucketing would mean re-bucketing on every attribute write. It would
-/// also charge every write for a grouping most of them never use, since effects
-/// are only built when something is actually replicating.
+/// Digest, then encode. Returns the number of records written.
 pub fn build_effects_buffer_v3(
-    p: &EffectsViewV3<'_>,
+    p: &Pending,
     g: &AtomicRefCell<Graph>,
     buf: &mut Vec<u8>,
 ) -> u64 {
-    let mut n_effects = 0u64;
     if buf.is_empty() {
         buf.push(v3::EFFECTS_VERSION);
     }
+    let mut n = 0;
+    for record in digest(p, g) {
+        encode(buf, &record);
+        n += 1;
+    }
+    n
+}
 
-    // --- Schema and attribute additions, each carrying its id ---
-    //
-    // These must precede every record that references the ids they
-    // introduce. That ordering is normative in v3, not incidental: the ids
-    // on the wire are only meaningful once the replica has agreed on the
-    // numbering that produced them.
+/// Every record a committed `Pending` implies, in apply order.
+///
+/// Eager in the grouping — a shape's members are only known once every entity
+/// has been seen — but the records themselves are yielded one at a time, so
+/// peak memory is the group map plus one record rather than all of them.
+///
+/// The shapes are **not** pre-grouped inside `Pending`, deliberately.
+/// Attributes accumulate incrementally — `set_node_attribute` inserts into a
+/// sorted vec — so `CREATE (n) SET n.a=1 SET n.b=2` changes that node's shape
+/// twice, and pre-bucketing would mean re-bucketing on every attribute write.
+/// It would also charge every write for a grouping most never use, since
+/// effects are only built when something is actually replicating.
+pub fn digest(
+    p: &Pending,
+    g: &AtomicRefCell<Graph>,
+) -> Vec<Record> {
+    let mut out = Vec::new();
+
+    // Schema and attribute additions first, each carrying its id. That ordering
+    // is normative in v3, not incidental: the ids on every later record are
+    // only meaningful once the replica has agreed on the numbering.
     {
         let graph = g.borrow();
         for (offset, label) in graph
@@ -56,8 +78,11 @@ pub fn build_effects_buffer_v3(
             .enumerate()
             .skip(p.schema_label_count)
         {
-            v3::write_add_schema(buf, v3::SchemaType::Node, offset as i32, label);
-            n_effects += 1;
+            out.push(Record::AddSchema {
+                schema_type: SchemaType::Node,
+                id: offset as i32,
+                name: label.to_string(),
+            });
         }
         for (offset, rel_type) in graph
             .get_types()
@@ -65,62 +90,147 @@ pub fn build_effects_buffer_v3(
             .enumerate()
             .skip(p.schema_rel_type_count)
         {
-            v3::write_add_schema(buf, v3::SchemaType::Edge, offset as i32, rel_type);
-            n_effects += 1;
+            out.push(Record::AddSchema {
+                schema_type: SchemaType::Edge,
+                id: offset as i32,
+                name: rel_type.to_string(),
+            });
         }
         // Once, not once per entity kind. #2459 unified the two attribute
-        // dictionaries, so `get_node_attribute_names` and
-        // `get_relationship_attribute_names` return the same store — and
-        // unlike v2's, v3's ADD_ATTRIBUTE has no node/relationship
-        // discriminator, so emitting both loops would send every new
-        // attribute twice under the same id.
+        // dictionaries, so both getters return the same store — and unlike
+        // v2's, v3's ADD_ATTRIBUTE has no node/relationship discriminator, so
+        // announcing per kind would send every new attribute twice under the
+        // same id.
         for (offset, attr) in graph
             .get_node_attribute_names()
             .iter()
             .enumerate()
             .skip(p.schema_node_attr_count)
         {
-            v3::write_add_attribute(buf, offset as u16, attr);
-            n_effects += 1;
+            out.push(Record::AddAttribute {
+                id: offset as u16,
+                name: attr.to_string(),
+            });
         }
     }
 
-    // --- Created nodes, grouped by (labels, attribute ids) ---
-    n_effects += emit_created_nodes_v3(p, buf);
-
-    // --- Created relationships, grouped by (type, attribute ids) ---
-    n_effects += emit_created_edges_v3(p, g, buf);
-
-    // --- Property updates on entities that already existed ---
-    n_effects += emit_updates_v3(buf, p.existing_nodes_attrs, v3::GraphEntity::Node);
-    n_effects += emit_updates_v3(buf, p.existing_relationships_attrs, v3::GraphEntity::Edge);
-
-    // --- Label changes on nodes this query did not create ---
+    digest_created_nodes(p, &mut out);
+    digest_created_edges(p, g, &mut out);
+    digest_updates(&p.existing_nodes_attrs, GraphEntity::Node, &mut out);
+    digest_updates(&p.existing_relationships_attrs, GraphEntity::Edge, &mut out);
     // A created node carries its labels in its CREATE_NODE record already.
-    n_effects += emit_labels_v3(buf, p.set_labels, Some(p.created_nodes), true);
-    n_effects += emit_labels_v3(buf, p.remove_labels, None, false);
-
-    // --- Deletions: edges before nodes, so the replica unhooks first ---
-    n_effects += emit_deleted_edges_v3(p, buf);
+    digest_labels(&p.set_labels, Some(&p.created_nodes), true, &mut out);
+    digest_labels(&p.remove_labels, None, false, &mut out);
+    // Edges before nodes, so the replica unhooks first.
+    digest_deleted_edges(p, &mut out);
     if !p.deleted_nodes.is_empty() {
-        let ids: Vec<u64> = p.deleted_nodes.iter().collect();
-        v3::write_delete_node(buf, &ids);
-        n_effects += 1;
+        out.push(Record::DeleteNode {
+            ids: p.deleted_nodes.iter().collect(),
+        });
     }
-
-    n_effects
+    out
 }
 
-fn emit_created_nodes_v3(
-    p: &EffectsViewV3<'_>,
+/// Write one record.
+fn encode(
     buf: &mut Vec<u8>,
-) -> u64 {
+    record: &Record,
+) {
+    match record {
+        Record::AddSchema {
+            schema_type,
+            id,
+            name,
+        } => v3::write_add_schema(buf, *schema_type, *id, name),
+        Record::AddAttribute { id, name } => v3::write_add_attribute(buf, *id, name),
+        Record::CreateNode {
+            ids,
+            labels,
+            attr_ids,
+            rows,
+        } => v3::write_create_node(buf, ids, labels, attr_ids, rows),
+        Record::CreateEdge {
+            ids,
+            relation_id,
+            src,
+            dst,
+            attr_ids,
+            rows,
+        } => v3::write_create_edge(buf, ids, *relation_id, src, dst, attr_ids, rows),
+        Record::Update {
+            entity,
+            ids,
+            attr_ids,
+            rows,
+        } => v3::write_update(buf, *entity, ids, attr_ids, rows),
+        Record::Labels { add, ids, labels } => v3::write_labels(buf, *add, ids, labels),
+        Record::DeleteNode { ids } => v3::write_delete_node(buf, ids),
+        Record::DeleteEdge {
+            ids,
+            relation_id,
+            src,
+            dst,
+        } => v3::write_delete_edge(buf, ids, *relation_id, src, dst),
+        Record::Index {
+            create,
+            schema_type,
+            label_id,
+            label,
+            attr_id,
+            attr,
+            field_type,
+            options,
+        } => {
+            let field = v3::IndexField {
+                attr_id: *attr_id,
+                attr,
+                field_type: *field_type,
+            };
+            if *create {
+                v3::write_create_index(
+                    buf,
+                    *schema_type,
+                    *label_id,
+                    label,
+                    field,
+                    options.as_ref().unwrap_or(&Value::Null),
+                );
+            } else {
+                v3::write_drop_index(buf, *schema_type, *label_id, label, field);
+            }
+        }
+        Record::Constraint {
+            create,
+            constraint_type,
+            entity_type,
+            label_id,
+            label,
+            props,
+        } => {
+            let props: Vec<(u16, &str)> = props.iter().map(|(i, n)| (*i, n.as_str())).collect();
+            v3::write_constraint(
+                buf,
+                *create,
+                *constraint_type,
+                *entity_type,
+                *label_id,
+                label,
+                &props,
+            );
+        }
+    }
+}
+
+fn digest_created_nodes(
+    p: &Pending,
+    out: &mut Vec<Record>,
+) {
     // Shape key: the node's labels and its attribute ids. Labels are sorted
     // because `set_labels` keeps caller order — [7,8] and [8,7] are the same
-    // shape, and emitting them ascending is what makes two engines that
-    // agree on the set produce the same bytes.
+    // shape, and emitting them ascending is what makes two engines that agree
+    // on the set produce the same bytes.
     let mut groups: FxHashMap<(Vec<i32>, Vec<u16>), Vec<u64>> = FxHashMap::default();
-    for id in p.created_nodes {
+    for id in &p.created_nodes {
         let mut labels: Vec<i32> = p
             .set_labels
             .get(&id)
@@ -135,27 +245,27 @@ fn emit_created_nodes_v3(
             .unwrap_or_default();
         groups.entry((labels, attr_ids)).or_default().push(id);
     }
-
-    let mut n = 0;
     for ((labels, attr_ids), ids) in sorted_groups(groups) {
-        let rows = gather_rows(&ids, &attr_ids, p.new_nodes_attrs);
-        v3::write_create_node(buf, &ids, &labels, &attr_ids, &rows);
-        n += 1;
+        let rows = gather_rows(&ids, &attr_ids, &p.new_nodes_attrs);
+        out.push(Record::CreateNode {
+            ids,
+            labels,
+            attr_ids,
+            rows,
+        });
     }
-    n
 }
 
-fn emit_created_edges_v3(
-    p: &EffectsViewV3<'_>,
+fn digest_created_edges(
+    p: &Pending,
     g: &AtomicRefCell<Graph>,
-    buf: &mut Vec<u8>,
-) -> u64 {
+    out: &mut Vec<Record>,
+) {
     if p.created_rels_by_type.is_empty() {
-        return 0;
+        return;
     }
     let graph = g.borrow();
-    let mut n = 0;
-    for (type_name, entries) in p.created_rels_by_type {
+    for (type_name, entries) in &p.created_rels_by_type {
         let relation_id = graph
             .get_type_id(type_name)
             .expect("created relationship type must be registered")
@@ -175,42 +285,95 @@ fn emit_created_edges_v3(
                 .push((id, u64::from(from), u64::from(to)));
         }
         for (attr_ids, mut rows) in sorted_groups(groups) {
-            // IdSet requires ascending ids, and the endpoints must stay
-            // aligned with them, so sort the triples together.
+            // IdSet requires ascending ids, and the endpoints must stay aligned
+            // with them, so sort the triples together.
             rows.sort_unstable();
             let ids: Vec<u64> = rows.iter().map(|r| r.0).collect();
             let src: Vec<u64> = rows.iter().map(|r| r.1).collect();
             let dst: Vec<u64> = rows.iter().map(|r| r.2).collect();
-            let values = gather_rows(&ids, &attr_ids, p.new_relationships_attrs);
-            v3::write_create_edge(buf, &ids, relation_id, &src, &dst, &attr_ids, &values);
-            n += 1;
+            let values = gather_rows(&ids, &attr_ids, &p.new_relationships_attrs);
+            out.push(Record::CreateEdge {
+                ids,
+                relation_id,
+                src,
+                dst,
+                attr_ids,
+                rows: values,
+            });
         }
     }
-    n
 }
 
-fn emit_deleted_edges_v3(
-    p: &EffectsViewV3<'_>,
-    buf: &mut Vec<u8>,
-) -> u64 {
+fn digest_deleted_edges(
+    p: &Pending,
+    out: &mut Vec<Record>,
+) {
     let mut groups: FxHashMap<u64, Vec<(u64, u64, u64)>> = FxHashMap::default();
-    for &(rel_id, type_id, from, to) in p.deleted_endpoints {
+    for &(rel_id, type_id, from, to) in &p.deleted_endpoints {
         groups.entry(type_id).or_default().push((
             u64::from(rel_id),
             u64::from(from),
             u64::from(to),
         ));
     }
-    let mut n = 0;
     for (type_id, mut rows) in sorted_groups(groups) {
         rows.sort_unstable();
-        let ids: Vec<u64> = rows.iter().map(|r| r.0).collect();
-        let src: Vec<u64> = rows.iter().map(|r| r.1).collect();
-        let dst: Vec<u64> = rows.iter().map(|r| r.2).collect();
-        v3::write_delete_edge(buf, &ids, type_id as i32, &src, &dst);
-        n += 1;
+        out.push(Record::DeleteEdge {
+            ids: rows.iter().map(|r| r.0).collect(),
+            relation_id: type_id as i32,
+            src: rows.iter().map(|r| r.1).collect(),
+            dst: rows.iter().map(|r| r.2).collect(),
+        });
     }
-    n
+}
+
+/// `UPDATE_NODE` / `UPDATE_EDGE`, grouped by attribute shape.
+fn digest_updates(
+    attrs: &FxHashMap<u64, Vec<(u16, Value)>>,
+    entity: GraphEntity,
+    out: &mut Vec<Record>,
+) {
+    let mut groups: FxHashMap<Vec<u16>, Vec<u64>> = FxHashMap::default();
+    for (id, pairs) in attrs {
+        let shape: Vec<u16> = pairs.iter().map(|(aid, _)| *aid).collect();
+        groups.entry(shape).or_default().push(*id);
+    }
+    for (attr_ids, mut ids) in sorted_groups(groups) {
+        ids.sort_unstable();
+        let rows = gather_rows(&ids, &attr_ids, attrs);
+        out.push(Record::Update {
+            entity,
+            ids,
+            attr_ids,
+            rows,
+        });
+    }
+}
+
+/// `SET_LABELS` / `REMOVE_LABELS`, grouped by label set.
+///
+/// `skip` excludes nodes whose labels already travel inside their `CREATE_NODE`
+/// record.
+fn digest_labels(
+    labels: &FxHashMap<u64, Vec<u64>>,
+    skip: Option<&RoaringTreemap>,
+    add: bool,
+    out: &mut Vec<Record>,
+) {
+    let mut groups: FxHashMap<Vec<i32>, Vec<u64>> = FxHashMap::default();
+    for (&id, label_ids) in labels {
+        if skip.is_some_and(|s| s.contains(id)) {
+            continue;
+        }
+        let mut shape: Vec<i32> = label_ids.iter().map(|&v| v as i32).collect();
+        shape.sort_unstable();
+        shape.dedup();
+        groups.entry(shape).or_default().push(id);
+    }
+    for (labels, mut ids) in sorted_groups(groups) {
+        ids.sort_unstable();
+        out.push(Record::Labels { add, ids, labels });
+    }
 }
 
 /// Groups in a deterministic order.
@@ -237,63 +400,14 @@ fn gather_rows(
     for id in ids {
         let entity = attrs.get(id);
         for attr_id in attr_ids {
-            let value = entity
-                .and_then(|a| a.iter().find(|(aid, _)| aid == attr_id))
-                .map_or(Value::Null, |(_, v)| v.clone());
-            rows.push(value);
+            rows.push(
+                entity
+                    .and_then(|a| a.iter().find(|(aid, _)| aid == attr_id))
+                    .map_or(Value::Null, |(_, v)| v.clone()),
+            );
         }
     }
     rows
-}
-
-/// `UPDATE_NODE` / `UPDATE_EDGE`, grouped by attribute shape.
-fn emit_updates_v3(
-    buf: &mut Vec<u8>,
-    attrs: &FxHashMap<u64, Vec<(u16, Value)>>,
-    entity: crate::runtime::effects_v3::GraphEntity,
-) -> u64 {
-    let mut groups: FxHashMap<Vec<u16>, Vec<u64>> = FxHashMap::default();
-    for (id, pairs) in attrs {
-        let shape: Vec<u16> = pairs.iter().map(|(aid, _)| *aid).collect();
-        groups.entry(shape).or_default().push(*id);
-    }
-    let mut n = 0;
-    for (attr_ids, mut ids) in sorted_groups(groups) {
-        ids.sort_unstable();
-        let rows = gather_rows(&ids, &attr_ids, attrs);
-        v3::write_update(buf, entity, &ids, &attr_ids, &rows);
-        n += 1;
-    }
-    n
-}
-
-/// `SET_LABELS` / `REMOVE_LABELS`, grouped by label set.
-///
-/// `skip` excludes nodes whose labels already travel inside their
-/// `CREATE_NODE` record.
-fn emit_labels_v3(
-    buf: &mut Vec<u8>,
-    labels: &FxHashMap<u64, Vec<u64>>,
-    skip: Option<&RoaringTreemap>,
-    add: bool,
-) -> u64 {
-    let mut groups: FxHashMap<Vec<i32>, Vec<u64>> = FxHashMap::default();
-    for (&id, label_ids) in labels {
-        if skip.is_some_and(|s| s.contains(id)) {
-            continue;
-        }
-        let mut shape: Vec<i32> = label_ids.iter().map(|&v| v as i32).collect();
-        shape.sort_unstable();
-        shape.dedup();
-        groups.entry(shape).or_default().push(id);
-    }
-    let mut n = 0;
-    for (label_ids, mut ids) in sorted_groups(groups) {
-        ids.sort_unstable();
-        v3::write_labels(buf, add, &ids, &label_ids);
-        n += 1;
-    }
-    n
 }
 
 #[cfg(test)]
@@ -328,7 +442,7 @@ mod tests {
         g: &AtomicRefCell<Graph>,
     ) -> Vec<Record> {
         let mut buf = Vec::new();
-        build_effects_buffer_v3(&p.effects_view_v3(), g, &mut buf);
+        build_effects_buffer_v3(&p, g, &mut buf);
         read_buffer(&buf).expect("v3 buffer must decode")
     }
 
@@ -489,9 +603,9 @@ mod tests {
         }
 
         let mut a = Vec::new();
-        build_effects_buffer_v3(&forward.effects_view_v3(), &g, &mut a);
+        build_effects_buffer_v3(&forward, &g, &mut a);
         let mut b = Vec::new();
-        build_effects_buffer_v3(&backward.effects_view_v3(), &g, &mut b);
+        build_effects_buffer_v3(&backward, &g, &mut b);
         assert_eq!(a, b, "insertion order must not reach the wire");
     }
 
@@ -574,13 +688,66 @@ mod tests {
         p.stage_created_node(1, &[], &[]);
 
         let mut v2 = Vec::new();
-        crate::runtime::effects_v2::build_effects_buffer(&p.effects_view_v2(), &g, &mut v2);
+        crate::runtime::effects_v2::build_effects_buffer(&p, &g, &mut v2);
         let mut v3 = Vec::new();
-        build_effects_buffer_v3(&p.effects_view_v3(), &g, &mut v3);
+        build_effects_buffer_v3(&p, &g, &mut v3);
 
         // The version byte is what a reader dispatches on, so it has to differ.
         assert_eq!(v2[0], 2);
         assert_eq!(v3[0], 3);
+    }
+
+    #[test]
+    fn the_digest_is_what_the_bytes_decode_back_to() {
+        // The check the old shape could not make. Emit is now
+        // Pending -> Record -> bytes and apply is bytes -> Record -> Graph, so
+        // the two Record sets must be equal — a far stronger statement than
+        // "the buffer is the expected length", and it compares values rather
+        // than a byte count that could be right for the wrong reason.
+        let g = graph();
+        {
+            let mut graph = g.borrow_mut();
+            graph.get_label_id_mut("Person");
+            graph.add_node_attribute_name("name");
+            graph.add_node_attribute_name("age");
+        }
+        let mut p = Pending::default();
+        p.set_schema_baseline(&g);
+        for id in 0..200u64 {
+            p.stage_created_node(id, &[0], &[(0, Value::Int(id as i64)), (1, Value::Int(30))]);
+        }
+        for id in 200..250u64 {
+            p.stage_created_node(id, &[0], &[(0, Value::Int(id as i64))]);
+        }
+        p.stage_updated_node(500, &[(1, Value::Int(41))]);
+        p.stage_label_change(600, &[0]);
+
+        let digested = digest(&p, &g);
+        let mut buf = Vec::new();
+        build_effects_buffer_v3(&p, &g, &mut buf);
+
+        assert_eq!(read_buffer(&buf).unwrap(), digested);
+    }
+
+    #[test]
+    fn grouping_is_testable_without_bytes() {
+        // Shapes split on attribute ids, and the digest says so directly
+        // instead of the test having to decode a buffer to find out.
+        let g = graph();
+        let mut p = Pending::default();
+        p.set_schema_baseline(&g);
+        p.stage_created_node(1, &[], &[(0, Value::Int(1))]);
+        p.stage_created_node(2, &[], &[(1, Value::Int(2))]);
+
+        let records = digest(&p, &g);
+        assert_eq!(records.len(), 2);
+        for record in &records {
+            let Record::CreateNode { ids, attr_ids, .. } = record else {
+                panic!("expected creates, got {record:?}");
+            };
+            assert_eq!(ids.len(), 1, "one node per shape here");
+            assert_eq!(attr_ids.len(), 1);
+        }
     }
 
     #[test]
@@ -594,9 +761,9 @@ mod tests {
         }
 
         let mut v2 = Vec::new();
-        crate::runtime::effects_v2::build_effects_buffer(&p.effects_view_v2(), &g, &mut v2);
+        crate::runtime::effects_v2::build_effects_buffer(&p, &g, &mut v2);
         let mut v3 = Vec::new();
-        build_effects_buffer_v3(&p.effects_view_v3(), &g, &mut v3);
+        build_effects_buffer_v3(&p, &g, &mut v3);
         println!("\n  10,000 nodes: v2 {} B -> v3 {} B", v2.len(), v3.len());
         assert!(v3.len() * 2 < v2.len(), "v2 {} v3 {}", v2.len(), v3.len());
         assert_eq!(read_buffer(&v3).unwrap().len(), 1);

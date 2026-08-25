@@ -18,7 +18,7 @@ use atomic_refcell::AtomicRefCell;
 
 use crate::{
     graph::graph::Graph,
-    runtime::{pending::EffectsViewV2, value::Value},
+    runtime::{pending::Pending, value::Value},
 };
 
 // ── Effects buffer constants and helpers ──
@@ -328,7 +328,7 @@ pub fn read_value(
 /// else should grow a dependency on it: v3 is the format two engines can both
 /// read, and this one exists until every peer speaks it.
 pub fn build_effects_buffer(
-    p: &EffectsViewV2<'_>,
+    p: &Pending,
     g: &AtomicRefCell<Graph>,
     buf: &mut Vec<u8>,
 ) -> u64 {
@@ -398,7 +398,7 @@ pub fn build_effects_buffer(
     // registration order exactly.
 
     // --- Created nodes ---
-    for node_id in p.created_nodes {
+    for node_id in &p.created_nodes {
         buf.push(EFFECT_CREATE_NODE);
         buf.extend_from_slice(&node_id.to_le_bytes());
 
@@ -428,7 +428,7 @@ pub fn build_effects_buffer(
     // --- Created relationships ---
     if !p.created_rels_by_type.is_empty() {
         let graph = g.borrow();
-        for (type_name, entries) in p.created_rels_by_type {
+        for (type_name, entries) in &p.created_rels_by_type {
             let type_id = graph
                 .get_type_id(type_name)
                 .expect("created relationship type must be registered")
@@ -455,7 +455,7 @@ pub fn build_effects_buffer(
     }
 
     // --- Updated node attributes (existing nodes only) ---
-    for (node_id, attrs) in p.existing_nodes_attrs {
+    for (node_id, attrs) in &p.existing_nodes_attrs {
         buf.push(EFFECT_UPDATE_NODE);
         buf.extend_from_slice(&node_id.to_le_bytes());
         write_u16(buf, attrs.len() as u16);
@@ -467,7 +467,7 @@ pub fn build_effects_buffer(
     }
 
     // --- Updated relationship attributes (existing rels only) ---
-    for (rel_id, attrs) in p.existing_relationships_attrs {
+    for (rel_id, attrs) in &p.existing_relationships_attrs {
         buf.push(EFFECT_UPDATE_EDGE);
         buf.extend_from_slice(&rel_id.to_le_bytes());
         write_u16(buf, attrs.len() as u16);
@@ -479,7 +479,7 @@ pub fn build_effects_buffer(
     }
 
     // --- Set labels (non-created nodes only) ---
-    for (&node_id, label_ids) in p.set_labels {
+    for (&node_id, label_ids) in &p.set_labels {
         if !p.created_nodes.contains(node_id) {
             buf.push(EFFECT_SET_LABELS);
             buf.extend_from_slice(&node_id.to_le_bytes());
@@ -492,7 +492,7 @@ pub fn build_effects_buffer(
     }
 
     // --- Remove labels ---
-    for (&node_id, label_ids) in p.remove_labels {
+    for (&node_id, label_ids) in &p.remove_labels {
         buf.push(EFFECT_REMOVE_LABELS);
         buf.extend_from_slice(&node_id.to_le_bytes());
         write_u16(buf, label_ids.len() as u16);
@@ -503,7 +503,7 @@ pub fn build_effects_buffer(
     }
 
     // --- Deleted relationships (before nodes, so replica removes edges first) ---
-    for &(rel_id, _type_id, from, to) in p.deleted_endpoints {
+    for &(rel_id, _type_id, from, to) in &p.deleted_endpoints {
         buf.push(EFFECT_DELETE_EDGE);
         buf.extend_from_slice(&u64::from(rel_id).to_le_bytes());
         buf.extend_from_slice(&u64::from(from).to_le_bytes());
@@ -512,7 +512,7 @@ pub fn build_effects_buffer(
     }
 
     // --- Deleted nodes ---
-    for node_id in p.deleted_nodes {
+    for node_id in &p.deleted_nodes {
         buf.push(EFFECT_DELETE_NODE);
         buf.extend_from_slice(&node_id.to_le_bytes());
         n_effects += 1;

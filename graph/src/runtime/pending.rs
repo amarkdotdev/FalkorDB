@@ -129,104 +129,58 @@ fn lookup_sorted(
 ///
 /// All mutations during query execution are collected here and applied
 /// atomically at the end. This enables transactional semantics.
-/// What the **v3** emitter reads out of a `Pending`, borrowed.
+/// All mutations during query execution, applied atomically at the end.
 ///
-/// A narrow view rather than `pub(crate)` fields: this is the exact surface
-/// replication depends on, so widening it is a visible change rather than an
-/// accident. Building one costs nothing but references.
-///
-/// Separate from [`EffectsViewV2`] even though v3's fields are a strict subset
-/// of v2's, because the extra three would otherwise outlive the format that
-/// needs them: Rust does not warn on an unused `pub` field, so deleting
-/// `effects_v2.rs` would leave them behind silently, and any comment marking
-/// them v2-only would quietly become false. Thirteen duplicated declarations
-/// are the price of that not happening.
-pub struct EffectsViewV3<'a> {
-    pub created_nodes: &'a RoaringTreemap,
-    pub created_rels_by_type: &'a FxHashMap<Arc<String>, Vec<(RelationshipId, NodeId, NodeId)>>,
-    pub new_nodes_attrs: &'a FxHashMap<u64, Vec<(u16, Value)>>,
-    pub existing_nodes_attrs: &'a FxHashMap<u64, Vec<(u16, Value)>>,
-    pub new_relationships_attrs: &'a FxHashMap<u64, Vec<(u16, Value)>>,
-    pub existing_relationships_attrs: &'a FxHashMap<u64, Vec<(u16, Value)>>,
-    pub set_labels: &'a FxHashMap<u64, Vec<u64>>,
-    pub remove_labels: &'a FxHashMap<u64, Vec<u64>>,
-    pub deleted_nodes: &'a RoaringTreemap,
-    pub deleted_endpoints: &'a [DeletedEdge],
-    /// Dictionary sizes when the query started, so the emitter announces only
-    /// what this query added.
-    pub schema_label_count: usize,
-    pub schema_rel_type_count: usize,
-    pub schema_node_attr_count: usize,
-}
-
-/// What the **v2** emitter reads out of a `Pending`, borrowed.
-///
-/// Goes when `effects_v2.rs` goes. It is the wider of the two views:
-/// `created_rel_types`, `deleted_relationships` and `schema_rel_attr_count`
-/// exist only because v2's records need them.
-pub struct EffectsViewV2<'a> {
-    pub created_nodes: &'a RoaringTreemap,
-    pub created_rels_by_type: &'a FxHashMap<Arc<String>, Vec<(RelationshipId, NodeId, NodeId)>>,
-    pub created_rel_types: &'a FxHashMap<RelationshipId, Arc<String>>,
-    pub new_nodes_attrs: &'a FxHashMap<u64, Vec<(u16, Value)>>,
-    pub existing_nodes_attrs: &'a FxHashMap<u64, Vec<(u16, Value)>>,
-    pub new_relationships_attrs: &'a FxHashMap<u64, Vec<(u16, Value)>>,
-    pub existing_relationships_attrs: &'a FxHashMap<u64, Vec<(u16, Value)>>,
-    pub set_labels: &'a FxHashMap<u64, Vec<u64>>,
-    pub remove_labels: &'a FxHashMap<u64, Vec<u64>>,
-    pub deleted_nodes: &'a RoaringTreemap,
-    pub deleted_relationships: &'a RoaringTreemap,
-    pub deleted_endpoints: &'a [DeletedEdge],
-    pub schema_label_count: usize,
-    pub schema_rel_type_count: usize,
-    pub schema_node_attr_count: usize,
-    pub schema_rel_attr_count: usize,
-}
-
+/// The fields are `pub(crate)` rather than hidden behind per-format view
+/// structs. Those views were a projection — every field a reference to the same
+/// type — so they documented the dependency surface and did nothing else, while
+/// costing a struct and a constructor per wire format. What states that surface
+/// now is `effects_v3_emit::digest`, whose return type says precisely what
+/// replication makes of this.
 pub struct Pending {
     /// Nodes created in this transaction
-    created_nodes: RoaringTreemap,
+    pub(crate) created_nodes: RoaringTreemap,
     /// Relationships created, grouped by type: type_name → [(rel_id, from, to)]
-    created_rels_by_type: FxHashMap<Arc<String>, Vec<(RelationshipId, NodeId, NodeId)>>,
+    pub(crate) created_rels_by_type: FxHashMap<Arc<String>, Vec<(RelationshipId, NodeId, NodeId)>>,
     /// Reverse index: rel_id → type_name for O(1) existence/type lookups
-    created_rel_types: FxHashMap<RelationshipId, Arc<String>>,
+    pub(crate) created_rel_types: FxHashMap<RelationshipId, Arc<String>>,
     /// Nodes to be deleted
-    deleted_nodes: RoaringTreemap,
+    pub(crate) deleted_nodes: RoaringTreemap,
     /// Relationships to be deleted
-    deleted_relationships: RoaringTreemap,
+    pub(crate) deleted_relationships: RoaringTreemap,
     /// Endpoints for deleted relationships — populated by commit(), used by build_effects_buffer().
-    deleted_endpoints: Vec<DeletedEdge>,
+    pub(crate) deleted_endpoints: Vec<DeletedEdge>,
     /// Property updates for newly created nodes (fast path: skip fjall).
     /// Values are attribute-id-resolved, sorted by id, unique.
-    new_nodes_attrs: FxHashMap<u64, Vec<(u16, Value)>>,
+    pub(crate) new_nodes_attrs: FxHashMap<u64, Vec<(u16, Value)>>,
     /// Property updates for existing nodes (full merge path)
-    existing_nodes_attrs: FxHashMap<u64, Vec<(u16, Value)>>,
+    pub(crate) existing_nodes_attrs: FxHashMap<u64, Vec<(u16, Value)>>,
     /// Property updates for newly created relationships (fast path)
-    new_relationships_attrs: FxHashMap<u64, Vec<(u16, Value)>>,
+    pub(crate) new_relationships_attrs: FxHashMap<u64, Vec<(u16, Value)>>,
     /// Property updates for existing relationships (full merge path)
-    existing_relationships_attrs: FxHashMap<u64, Vec<(u16, Value)>>,
+    pub(crate) existing_relationships_attrs: FxHashMap<u64, Vec<(u16, Value)>>,
     /// Labels to add: node_id → [label_ids]
-    set_labels: FxHashMap<u64, Vec<u64>>,
+    pub(crate) set_labels: FxHashMap<u64, Vec<u64>>,
     /// Labels to remove: node_id → [label_ids]
-    remove_labels: FxHashMap<u64, Vec<u64>>,
+    pub(crate) remove_labels: FxHashMap<u64, Vec<u64>>,
     /// Documents to add to indexes (keyed by label id)
-    index_add_docs: FxHashMap<u64, RoaringTreemap>,
+    pub(crate) index_add_docs: FxHashMap<u64, RoaringTreemap>,
     /// Documents to remove from indexes (keyed by label id)
-    index_remove_docs: FxHashMap<u64, RoaringTreemap>,
+    pub(crate) index_remove_docs: FxHashMap<u64, RoaringTreemap>,
     /// Edge documents to add to indexes (keyed by relationship type id)
-    index_add_edge_docs: FxHashMap<u64, RoaringTreemap>,
+    pub(crate) index_add_edge_docs: FxHashMap<u64, RoaringTreemap>,
     /// Edge documents to remove from indexes: `type_id → { edge_id → (src, dst) }`.
     /// `(src, dst)` is captured at deletion time — the edge is gone
     /// from the tensor by the time `commit_edge_index` runs so the
     /// 24-byte RediSearch key must be reconstructable from here.
-    index_remove_edge_docs: FxHashMap<u64, FxHashMap<u64, (u64, u64)>>,
+    pub(crate) index_remove_edge_docs: FxHashMap<u64, FxHashMap<u64, (u64, u64)>>,
     /// Deferred index operations — accumulated across commit cycles,
     /// applied only after the full query succeeds so that a failed
     /// query never leaves stale entries in RediSearch.
-    deferred_index_adds: FxHashMap<u64, RoaringTreemap>,
-    deferred_index_removes: FxHashMap<u64, RoaringTreemap>,
-    deferred_edge_index_adds: FxHashMap<u64, RoaringTreemap>,
-    deferred_edge_index_removes: FxHashMap<u64, FxHashMap<u64, (u64, u64)>>,
+    pub(crate) deferred_index_adds: FxHashMap<u64, RoaringTreemap>,
+    pub(crate) deferred_index_removes: FxHashMap<u64, RoaringTreemap>,
+    pub(crate) deferred_edge_index_adds: FxHashMap<u64, RoaringTreemap>,
+    pub(crate) deferred_edge_index_removes: FxHashMap<u64, FxHashMap<u64, (u64, u64)>>,
     /// Union of every index document this query has published, accumulated across
     /// all of its `Commit`s, so a later failure can resync them against committed
     /// state (see [`Self::resync_published_indexes`]).
@@ -236,23 +190,23 @@ pub struct Pending {
     /// Per-query state — `Pending` belongs to one `Runtime`.
     published: DeferredIndexes,
     /// Schema baseline: number of labels when the current commit window started.
-    schema_label_count: usize,
+    pub(crate) schema_label_count: usize,
     /// Schema baseline: number of relationship types when the current commit window started.
-    schema_rel_type_count: usize,
+    pub(crate) schema_rel_type_count: usize,
     /// Schema baseline: number of node attribute names when the current commit window started.
-    schema_node_attr_count: usize,
+    pub(crate) schema_node_attr_count: usize,
     /// Schema baseline: number of relationship attribute names when the current commit window started.
-    schema_rel_attr_count: usize,
+    pub(crate) schema_rel_attr_count: usize,
 }
 
 /// One `Commit`'s index document changes, collected while applying `pending` and
 /// written to RediSearch as a batch.
 #[derive(Default)]
 pub struct DeferredIndexes {
-    node_adds: FxHashMap<u64, RoaringTreemap>,
-    node_removes: FxHashMap<u64, RoaringTreemap>,
-    edge_adds: FxHashMap<u64, RoaringTreemap>,
-    edge_removes: FxHashMap<u64, FxHashMap<u64, (u64, u64)>>,
+    pub(crate) node_adds: FxHashMap<u64, RoaringTreemap>,
+    pub(crate) node_removes: FxHashMap<u64, RoaringTreemap>,
+    pub(crate) edge_adds: FxHashMap<u64, RoaringTreemap>,
+    pub(crate) edge_removes: FxHashMap<u64, FxHashMap<u64, (u64, u64)>>,
 }
 
 impl DeferredIndexes {
@@ -1561,67 +1515,5 @@ impl Pending {
         edges: Vec<DeletedEdge>,
     ) {
         self.deleted_endpoints = edges;
-    }
-
-    /// Build a **v3** effects payload: one record per `(opcode, partition key)`
-    /// instead of one per entity.
-    ///
-    /// Not yet wired to replication — [`Self::build_effects_buffer`] still owns
-    /// that. Both exist side by side until the C engine can read v3, because a
-    /// master that emits v3 to a v2 replica is a silent data-loss bug, not a
-    /// degraded mode.
-    ///
-    /// The grouping is cheap because `Pending` already stores most of it:
-    /// `created_nodes` is a `RoaringTreemap`, so ids arrive ascending for free;
-    /// `created_rels_by_type` is already partitioned by relationship type; and
-    /// the attribute vectors are already "sorted by id, unique", which is
-    /// exactly the shape key.
-    /// The slice of this `Pending` that **v3** replication reads.
-    ///
-    /// The wire format lives in `effects_v3_emit`; this hands it a borrowed
-    /// view so the fields above stay private and the set of things replication
-    /// depends on stays explicit.
-    #[must_use]
-    pub fn effects_view_v3(&self) -> EffectsViewV3<'_> {
-        EffectsViewV3 {
-            created_nodes: &self.created_nodes,
-            created_rels_by_type: &self.created_rels_by_type,
-            new_nodes_attrs: &self.new_nodes_attrs,
-            existing_nodes_attrs: &self.existing_nodes_attrs,
-            new_relationships_attrs: &self.new_relationships_attrs,
-            existing_relationships_attrs: &self.existing_relationships_attrs,
-            set_labels: &self.set_labels,
-            remove_labels: &self.remove_labels,
-            deleted_nodes: &self.deleted_nodes,
-            deleted_endpoints: &self.deleted_endpoints,
-            schema_label_count: self.schema_label_count,
-            schema_rel_type_count: self.schema_rel_type_count,
-            schema_node_attr_count: self.schema_node_attr_count,
-        }
-    }
-
-    /// The slice of this `Pending` that **v2** replication reads.
-    ///
-    /// Delete with `effects_v2.rs`.
-    #[must_use]
-    pub fn effects_view_v2(&self) -> EffectsViewV2<'_> {
-        EffectsViewV2 {
-            created_nodes: &self.created_nodes,
-            created_rels_by_type: &self.created_rels_by_type,
-            created_rel_types: &self.created_rel_types,
-            new_nodes_attrs: &self.new_nodes_attrs,
-            existing_nodes_attrs: &self.existing_nodes_attrs,
-            new_relationships_attrs: &self.new_relationships_attrs,
-            existing_relationships_attrs: &self.existing_relationships_attrs,
-            set_labels: &self.set_labels,
-            remove_labels: &self.remove_labels,
-            deleted_nodes: &self.deleted_nodes,
-            deleted_relationships: &self.deleted_relationships,
-            deleted_endpoints: &self.deleted_endpoints,
-            schema_label_count: self.schema_label_count,
-            schema_rel_type_count: self.schema_rel_type_count,
-            schema_node_attr_count: self.schema_node_attr_count,
-            schema_rel_attr_count: self.schema_rel_attr_count,
-        }
     }
 }

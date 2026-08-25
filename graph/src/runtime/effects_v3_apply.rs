@@ -775,11 +775,7 @@ mod tests {
         }
 
         let mut buf = Vec::new();
-        crate::runtime::effects_v3_emit::build_effects_buffer_v3(
-            &p.effects_view_v3(),
-            &master,
-            &mut buf,
-        );
+        crate::runtime::effects_v3_emit::build_effects_buffer_v3(&p, &master, &mut buf);
         assert_eq!(
             read_buffer(&buf).unwrap().len(),
             5,
