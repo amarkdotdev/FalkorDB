@@ -7,7 +7,7 @@
 
 use crate::{
     graph::graph::Graph,
-    runtime::{effects_v3 as v3, pending::PendingEffects, value::Value},
+    runtime::{effects_v3 as v3, pending::EffectsViewV3, value::Value},
 };
 use atomic_refcell::AtomicRefCell;
 use roaring::RoaringTreemap;
@@ -33,7 +33,7 @@ use rustc_hash::FxHashMap;
 /// also charge every write for a grouping most of them never use, since effects
 /// are only built when something is actually replicating.
 pub fn build_effects_buffer_v3(
-    p: &PendingEffects<'_>,
+    p: &EffectsViewV3<'_>,
     g: &AtomicRefCell<Graph>,
     buf: &mut Vec<u8>,
 ) -> u64 {
@@ -112,7 +112,7 @@ pub fn build_effects_buffer_v3(
 }
 
 fn emit_created_nodes_v3(
-    p: &PendingEffects<'_>,
+    p: &EffectsViewV3<'_>,
     buf: &mut Vec<u8>,
 ) -> u64 {
     // Shape key: the node's labels and its attribute ids. Labels are sorted
@@ -146,7 +146,7 @@ fn emit_created_nodes_v3(
 }
 
 fn emit_created_edges_v3(
-    p: &PendingEffects<'_>,
+    p: &EffectsViewV3<'_>,
     g: &AtomicRefCell<Graph>,
     buf: &mut Vec<u8>,
 ) -> u64 {
@@ -190,7 +190,7 @@ fn emit_created_edges_v3(
 }
 
 fn emit_deleted_edges_v3(
-    p: &PendingEffects<'_>,
+    p: &EffectsViewV3<'_>,
     buf: &mut Vec<u8>,
 ) -> u64 {
     let mut groups: FxHashMap<u64, Vec<(u64, u64, u64)>> = FxHashMap::default();
@@ -328,7 +328,7 @@ mod tests {
         g: &AtomicRefCell<Graph>,
     ) -> Vec<Record> {
         let mut buf = Vec::new();
-        build_effects_buffer_v3(&p.effects_view(), g, &mut buf);
+        build_effects_buffer_v3(&p.effects_view_v3(), g, &mut buf);
         read_buffer(&buf).expect("v3 buffer must decode")
     }
 
@@ -489,9 +489,9 @@ mod tests {
         }
 
         let mut a = Vec::new();
-        build_effects_buffer_v3(&forward.effects_view(), &g, &mut a);
+        build_effects_buffer_v3(&forward.effects_view_v3(), &g, &mut a);
         let mut b = Vec::new();
-        build_effects_buffer_v3(&backward.effects_view(), &g, &mut b);
+        build_effects_buffer_v3(&backward.effects_view_v3(), &g, &mut b);
         assert_eq!(a, b, "insertion order must not reach the wire");
     }
 
@@ -574,9 +574,9 @@ mod tests {
         p.stage_created_node(1, &[], &[]);
 
         let mut v2 = Vec::new();
-        crate::runtime::effects_v2::build_effects_buffer(&p.effects_view(), &g, &mut v2);
+        crate::runtime::effects_v2::build_effects_buffer(&p.effects_view_v2(), &g, &mut v2);
         let mut v3 = Vec::new();
-        build_effects_buffer_v3(&p.effects_view(), &g, &mut v3);
+        build_effects_buffer_v3(&p.effects_view_v3(), &g, &mut v3);
 
         // The version byte is what a reader dispatches on, so it has to differ.
         assert_eq!(v2[0], 2);
@@ -594,9 +594,9 @@ mod tests {
         }
 
         let mut v2 = Vec::new();
-        crate::runtime::effects_v2::build_effects_buffer(&p.effects_view(), &g, &mut v2);
+        crate::runtime::effects_v2::build_effects_buffer(&p.effects_view_v2(), &g, &mut v2);
         let mut v3 = Vec::new();
-        build_effects_buffer_v3(&p.effects_view(), &g, &mut v3);
+        build_effects_buffer_v3(&p.effects_view_v3(), &g, &mut v3);
         println!("\n  10,000 nodes: v2 {} B -> v3 {} B", v2.len(), v3.len());
         assert!(v3.len() * 2 < v2.len(), "v2 {} v3 {}", v2.len(), v3.len());
         assert_eq!(read_buffer(&v3).unwrap().len(), 1);

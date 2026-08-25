@@ -129,25 +129,21 @@ fn lookup_sorted(
 ///
 /// All mutations during query execution are collected here and applied
 /// atomically at the end. This enables transactional semantics.
-/// Everything an effects emitter reads out of a `Pending`, borrowed.
-///
-/// Defined here rather than in either emitter because it describes `Pending`,
-/// and must outlive whichever of `effects_v2` / `effects_v3_emit` is deleted
-/// first.
+/// What the **v3** emitter reads out of a `Pending`, borrowed.
 ///
 /// A narrow view rather than `pub(crate)` fields: this is the exact surface
 /// replication depends on, so widening it is a visible change rather than an
 /// accident. Building one costs nothing but references.
-pub struct PendingEffects<'a> {
+///
+/// Separate from [`EffectsViewV2`] even though v3's fields are a strict subset
+/// of v2's, because the extra three would otherwise outlive the format that
+/// needs them: Rust does not warn on an unused `pub` field, so deleting
+/// `effects_v2.rs` would leave them behind silently, and any comment marking
+/// them v2-only would quietly become false. Thirteen duplicated declarations
+/// are the price of that not happening.
+pub struct EffectsViewV3<'a> {
     pub created_nodes: &'a RoaringTreemap,
-    pub created_rels_by_type: &'a FxHashMap<
-        Arc<String>,
-        Vec<(
-            crate::graph::graph::RelationshipId,
-            crate::graph::graph::NodeId,
-            crate::graph::graph::NodeId,
-        )>,
-    >,
+    pub created_rels_by_type: &'a FxHashMap<Arc<String>, Vec<(RelationshipId, NodeId, NodeId)>>,
     pub new_nodes_attrs: &'a FxHashMap<u64, Vec<(u16, Value)>>,
     pub existing_nodes_attrs: &'a FxHashMap<u64, Vec<(u16, Value)>>,
     pub new_relationships_attrs: &'a FxHashMap<u64, Vec<(u16, Value)>>,
@@ -156,17 +152,35 @@ pub struct PendingEffects<'a> {
     pub remove_labels: &'a FxHashMap<u64, Vec<u64>>,
     pub deleted_nodes: &'a RoaringTreemap,
     pub deleted_endpoints: &'a [DeletedEdge],
-    /// Sizes of the graph's dictionaries when the query started, so the
-    /// emitter can announce only what this query added.
+    /// Dictionary sizes when the query started, so the emitter announces only
+    /// what this query added.
     pub schema_label_count: usize,
     pub schema_rel_type_count: usize,
     pub schema_node_attr_count: usize,
-    /// Only v2 reads these three; v3's records do not need them. They stay on
-    /// the view so that deleting `effects_v2.rs` is the only change retiring
-    /// the old format takes.
-    pub schema_rel_attr_count: usize,
-    pub created_rel_types: &'a FxHashMap<crate::graph::graph::RelationshipId, Arc<String>>,
+}
+
+/// What the **v2** emitter reads out of a `Pending`, borrowed.
+///
+/// Goes when `effects_v2.rs` goes. It is the wider of the two views:
+/// `created_rel_types`, `deleted_relationships` and `schema_rel_attr_count`
+/// exist only because v2's records need them.
+pub struct EffectsViewV2<'a> {
+    pub created_nodes: &'a RoaringTreemap,
+    pub created_rels_by_type: &'a FxHashMap<Arc<String>, Vec<(RelationshipId, NodeId, NodeId)>>,
+    pub created_rel_types: &'a FxHashMap<RelationshipId, Arc<String>>,
+    pub new_nodes_attrs: &'a FxHashMap<u64, Vec<(u16, Value)>>,
+    pub existing_nodes_attrs: &'a FxHashMap<u64, Vec<(u16, Value)>>,
+    pub new_relationships_attrs: &'a FxHashMap<u64, Vec<(u16, Value)>>,
+    pub existing_relationships_attrs: &'a FxHashMap<u64, Vec<(u16, Value)>>,
+    pub set_labels: &'a FxHashMap<u64, Vec<u64>>,
+    pub remove_labels: &'a FxHashMap<u64, Vec<u64>>,
+    pub deleted_nodes: &'a RoaringTreemap,
     pub deleted_relationships: &'a RoaringTreemap,
+    pub deleted_endpoints: &'a [DeletedEdge],
+    pub schema_label_count: usize,
+    pub schema_rel_type_count: usize,
+    pub schema_node_attr_count: usize,
+    pub schema_rel_attr_count: usize,
 }
 
 pub struct Pending {
@@ -1562,14 +1576,14 @@ impl Pending {
     /// `created_rels_by_type` is already partitioned by relationship type; and
     /// the attribute vectors are already "sorted by id, unique", which is
     /// exactly the shape key.
-    /// The slice of this `Pending` that replication reads.
+    /// The slice of this `Pending` that **v3** replication reads.
     ///
     /// The wire format lives in `effects_v3_emit`; this hands it a borrowed
-    /// view so the fields above stay private and the set of things
-    /// replication depends on stays explicit.
+    /// view so the fields above stay private and the set of things replication
+    /// depends on stays explicit.
     #[must_use]
-    pub fn effects_view(&self) -> PendingEffects<'_> {
-        PendingEffects {
+    pub fn effects_view_v3(&self) -> EffectsViewV3<'_> {
+        EffectsViewV3 {
             created_nodes: &self.created_nodes,
             created_rels_by_type: &self.created_rels_by_type,
             new_nodes_attrs: &self.new_nodes_attrs,
@@ -1583,9 +1597,31 @@ impl Pending {
             schema_label_count: self.schema_label_count,
             schema_rel_type_count: self.schema_rel_type_count,
             schema_node_attr_count: self.schema_node_attr_count,
-            schema_rel_attr_count: self.schema_rel_attr_count,
+        }
+    }
+
+    /// The slice of this `Pending` that **v2** replication reads.
+    ///
+    /// Delete with `effects_v2.rs`.
+    #[must_use]
+    pub fn effects_view_v2(&self) -> EffectsViewV2<'_> {
+        EffectsViewV2 {
+            created_nodes: &self.created_nodes,
+            created_rels_by_type: &self.created_rels_by_type,
             created_rel_types: &self.created_rel_types,
+            new_nodes_attrs: &self.new_nodes_attrs,
+            existing_nodes_attrs: &self.existing_nodes_attrs,
+            new_relationships_attrs: &self.new_relationships_attrs,
+            existing_relationships_attrs: &self.existing_relationships_attrs,
+            set_labels: &self.set_labels,
+            remove_labels: &self.remove_labels,
+            deleted_nodes: &self.deleted_nodes,
             deleted_relationships: &self.deleted_relationships,
+            deleted_endpoints: &self.deleted_endpoints,
+            schema_label_count: self.schema_label_count,
+            schema_rel_type_count: self.schema_rel_type_count,
+            schema_node_attr_count: self.schema_node_attr_count,
+            schema_rel_attr_count: self.schema_rel_attr_count,
         }
     }
 }

@@ -110,13 +110,13 @@ impl<'a> Iterator for CommitOp<'a> {
                         let buf = buf_ref.get_or_insert_with(Vec::new);
                         let n_effects = if crate::runtime::pending::emit_v3() {
                             crate::runtime::effects_v3_emit::build_effects_buffer_v3(
-                                &pending.effects_view(),
+                                &pending.effects_view_v3(),
                                 &self.runtime.g,
                                 buf,
                             )
                         } else {
                             crate::runtime::effects_v2::build_effects_buffer(
-                                &pending.effects_view(),
+                                &pending.effects_view_v2(),
                                 &self.runtime.g,
                                 buf,
                             )

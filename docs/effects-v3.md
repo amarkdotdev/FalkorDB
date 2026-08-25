@@ -406,10 +406,15 @@ The v2 emitter sits beside it in `effects_v2.rs`, whole and separate, so
 retiring the old format is deleting a file rather than untangling one. Neither
 lives in `pending.rs`: a mutation accumulator should not know what a
 replication frame looks like, and the wire format should not reach into
-query-execution state to find out what changed. `Pending` exposes one
-`effects_view()` returning a borrowed `PendingEffects` — a narrow, explicit
-statement of what replication depends on, rather than `pub(crate)` fields that
-widen by accident.
+query-execution state to find out what changed. `Pending` exposes one borrowed view per format —
+`effects_view_v3()` and `effects_view_v2()` — a narrow, explicit statement of
+what each depends on, rather than `pub(crate)` fields that widen by accident.
+
+They are separate structs even though v3's thirteen fields are a strict subset
+of v2's sixteen. Rust does not warn on an unused `pub` field, so a shared view
+would leave v2's three extras behind when `effects_v2.rs` goes, and any comment
+marking them v2-only would quietly become false. Thirteen duplicated
+declarations are the price of that not happening.
 
 **The shapes are deliberately not pre-grouped inside `Pending`.** Attributes
 accumulate incrementally — `set_node_attribute` inserts into a sorted vec — so

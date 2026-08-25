@@ -18,7 +18,7 @@ use atomic_refcell::AtomicRefCell;
 
 use crate::{
     graph::graph::Graph,
-    runtime::{pending::PendingEffects, value::Value},
+    runtime::{pending::EffectsViewV2, value::Value},
 };
 
 // ── Effects buffer constants and helpers ──
@@ -328,7 +328,7 @@ pub fn read_value(
 /// else should grow a dependency on it: v3 is the format two engines can both
 /// read, and this one exists until every peer speaks it.
 pub fn build_effects_buffer(
-    p: &PendingEffects<'_>,
+    p: &EffectsViewV2<'_>,
     g: &AtomicRefCell<Graph>,
     buf: &mut Vec<u8>,
 ) -> u64 {
