@@ -5,8 +5,8 @@ use roaring::RoaringTreemap;
 use crate::runtime::value::Value;
 
 use super::{
-    DecodeError, ENC_COMPRESSED, ENC_PLAIN, Reader, read_value, write_label_id, write_u8,
-    write_u16, write_u32, write_value,
+    BlockEncoding, DecodeError, Reader, read_value, write_label_id, write_u8, write_u16, write_u32,
+    write_value,
 };
 
 // ── IdSet ──
@@ -63,12 +63,12 @@ pub fn write_id_set(
     let roaring_bytes = 4 + bitmap.serialized_size();
 
     if roaring_bytes < plain_bytes {
-        write_u8(buf, ENC_COMPRESSED);
+        write_u8(buf, BlockEncoding::Compressed.as_u8());
         let blob = serialize_bitmap(&bitmap);
         write_u32(buf, blob.len() as u32);
         buf.extend_from_slice(&blob);
     } else {
-        write_u8(buf, ENC_PLAIN);
+        write_u8(buf, BlockEncoding::Plain.as_u8());
         write_u8(buf, width);
         write_widths(buf, ids, width);
     }
@@ -83,8 +83,8 @@ pub fn read_id_set(
     r: &mut Reader<'_>,
     count: u32,
 ) -> Result<Vec<u64>, DecodeError> {
-    match r.u8()? {
-        ENC_PLAIN => {
+    match BlockEncoding::try_from(r.u8()?)? {
+        BlockEncoding::Plain => {
             let width = r.u8()?;
             if !matches!(width, 1 | 2 | 4 | 8) {
                 return Err(DecodeError::BadIndexWidth(width));
@@ -92,7 +92,7 @@ pub fn read_id_set(
             let n = r.guard_count(u64::from(count), width as usize)?;
             read_widths(r, n, width)
         }
-        ENC_COMPRESSED => {
+        BlockEncoding::Compressed => {
             let blob_len = r.u32()?;
             let blob = r.take(blob_len as usize)?;
             let bitmap = RoaringTreemap::deserialize_from(blob)
@@ -105,7 +105,6 @@ pub fn read_id_set(
             }
             Ok(bitmap.iter().collect())
         }
-        other => Err(DecodeError::BadEncoding(other)),
     }
 }
 
@@ -239,7 +238,7 @@ pub fn write_id_list(
         let rank_width = idx_width_for(dict.len());
         let dict_bytes = 5 + dict.serialized_size() + ids.len() * rank_width as usize;
         if dict_bytes < raw_bytes {
-            write_u8(buf, ENC_COMPRESSED);
+            write_u8(buf, BlockEncoding::Compressed.as_u8());
             let blob = serialize_bitmap(&dict);
             write_u32(buf, blob.len() as u32);
             buf.extend_from_slice(&blob);
@@ -249,7 +248,7 @@ pub fn write_id_list(
         }
     }
 
-    write_u8(buf, ENC_PLAIN);
+    write_u8(buf, BlockEncoding::Plain.as_u8());
     write_u8(buf, raw_width);
     write_widths(buf, ids, raw_width);
 }
@@ -340,13 +339,13 @@ fn duplication_probe_passes(ids: &[u64]) -> bool {
 pub fn write_id_list_forced(
     buf: &mut Vec<u8>,
     ids: &[u64],
-    encoding: u8,
+    encoding: BlockEncoding,
 ) {
-    if encoding == ENC_COMPRESSED {
+    if encoding == BlockEncoding::Compressed {
         let ascending = distinct_ascending(ids);
         let dict = build_bitmap(&ascending);
         let width = idx_width_for(dict.len());
-        write_u8(buf, ENC_COMPRESSED);
+        write_u8(buf, BlockEncoding::Compressed.as_u8());
         let blob = serialize_bitmap(&dict);
         write_u32(buf, blob.len() as u32);
         buf.extend_from_slice(&blob);
@@ -355,7 +354,7 @@ pub fn write_id_list_forced(
     } else {
         let max = ids.iter().copied().max().unwrap_or(0);
         let width = value_width_for(max);
-        write_u8(buf, ENC_PLAIN);
+        write_u8(buf, BlockEncoding::Plain.as_u8());
         write_u8(buf, width);
         write_widths(buf, ids, width);
     }
@@ -366,8 +365,8 @@ pub fn read_id_list(
     r: &mut Reader<'_>,
     count: u32,
 ) -> Result<Vec<u64>, DecodeError> {
-    match r.u8()? {
-        ENC_PLAIN => {
+    match BlockEncoding::try_from(r.u8()?)? {
+        BlockEncoding::Plain => {
             let width = r.u8()?;
             if !matches!(width, 1 | 2 | 4 | 8) {
                 return Err(DecodeError::BadIndexWidth(width));
@@ -375,7 +374,7 @@ pub fn read_id_list(
             let n = r.guard_count(u64::from(count), width as usize)?;
             read_widths(r, n, width)
         }
-        ENC_COMPRESSED => {
+        BlockEncoding::Compressed => {
             let dict_len = r.u32()?;
             let blob = r.take(dict_len as usize)?;
             let dict = RoaringTreemap::deserialize_from(blob)
@@ -402,7 +401,6 @@ pub fn read_id_list(
                 })
                 .collect()
         }
-        other => Err(DecodeError::BadEncoding(other)),
     }
 }
 
@@ -528,7 +526,7 @@ mod tests {
         let ids: Vec<u64> = (0..10_000).collect();
         let mut buf = Vec::new();
         write_id_set(&mut buf, &ids);
-        assert_eq!(buf[0], ENC_COMPRESSED);
+        assert_eq!(buf[0], BlockEncoding::Compressed.as_u8());
         assert_eq!(buf.len(), 32, "1 enc + 4 blob_len + 27 bitmap");
 
         let mut r = Reader::new(&buf);
@@ -543,7 +541,7 @@ mod tests {
         let ids: Vec<u64> = (0..1_024).map(|i| i << 32).collect();
         let mut buf = Vec::new();
         write_id_set(&mut buf, &ids);
-        assert_eq!(buf[0], ENC_PLAIN);
+        assert_eq!(buf[0], BlockEncoding::Plain.as_u8());
         assert_eq!(buf[1], 8, "ids past 2^32 need the full width");
         assert_eq!(buf.len(), 2 + 1_024 * 8);
 
@@ -592,10 +590,14 @@ mod tests {
 
         let mut buf = Vec::new();
         write_id_list(&mut buf, &src);
-        assert_eq!(buf[0], ENC_COMPRESSED, "the dictionary should win here");
+        assert_eq!(
+            buf[0],
+            BlockEncoding::Compressed.as_u8(),
+            "the dictionary should win here"
+        );
 
         let mut narrow = Vec::new();
-        write_id_list_forced(&mut narrow, &src, ENC_PLAIN);
+        write_id_list_forced(&mut narrow, &src, BlockEncoding::Plain);
         assert!(
             buf.len() < narrow.len(),
             "dict {} should beat narrow {}",
@@ -617,10 +619,10 @@ mod tests {
         let src: Vec<u64> = (0..10_000).map(|i| (i * 6) % 60_000).collect();
         let mut buf = Vec::new();
         write_id_list(&mut buf, &src);
-        assert_eq!(buf[0], ENC_PLAIN);
+        assert_eq!(buf[0], BlockEncoding::Plain.as_u8());
 
         let mut dict = Vec::new();
-        write_id_list_forced(&mut dict, &src, ENC_COMPRESSED);
+        write_id_list_forced(&mut dict, &src, BlockEncoding::Compressed);
         assert!(buf.len() < dict.len(), "{} vs {}", buf.len(), dict.len());
 
         let mut r = Reader::new(&buf);
@@ -634,7 +636,7 @@ mod tests {
         let src: Vec<u64> = (0..1_000).map(|i| i << 32).collect();
         let mut buf = Vec::new();
         write_id_list(&mut buf, &src);
-        assert_eq!(buf[0], ENC_PLAIN);
+        assert_eq!(buf[0], BlockEncoding::Plain.as_u8());
         assert_eq!(buf[1], 8, "ids past 2^32 need the full width");
         assert_eq!(buf.len(), 2 + 1_000 * 8);
 
@@ -688,13 +690,13 @@ mod tests {
             let rows = 10_000;
             let ids = endpoints(rows, distinct, nodes);
             let mut p = Vec::new();
-            write_id_list_forced(&mut p, &ids, ENC_PLAIN);
+            write_id_list_forced(&mut p, &ids, BlockEncoding::Plain);
             let mut d = Vec::new();
-            write_id_list_forced(&mut d, &ids, ENC_COMPRESSED);
+            write_id_list_forced(&mut d, &ids, BlockEncoding::Compressed);
             let mut auto = Vec::new();
             write_id_list(&mut auto, &ids);
 
-            let picked = if auto[0] == ENC_COMPRESSED {
+            let picked = if auto[0] == BlockEncoding::Compressed.as_u8() {
                 "dict"
             } else {
                 "raw"
@@ -717,7 +719,7 @@ mod tests {
             // What must hold is that the two cheap encodings are always beaten.
             assert!(auto.len() <= p.len());
             // And when the dictionary is chosen, it is genuinely the smallest.
-            if auto[0] == ENC_COMPRESSED {
+            if auto[0] == BlockEncoding::Compressed.as_u8() {
                 assert_eq!(auto.len(), d.len().min(p.len()));
             }
             // and whatever was picked must round-trip
@@ -741,8 +743,8 @@ mod tests {
     fn id_list_rejects_an_out_of_range_rank() {
         let src = [5_u64; 10];
         let mut buf = Vec::new();
-        write_id_list_forced(&mut buf, &src, ENC_COMPRESSED);
-        assert_eq!(buf[0], ENC_COMPRESSED);
+        write_id_list_forced(&mut buf, &src, BlockEncoding::Compressed);
+        assert_eq!(buf[0], BlockEncoding::Compressed.as_u8());
         // The dictionary holds one entry, so rank 1 is out of range.
         *buf.last_mut().unwrap() = 1;
         let mut r = Reader::new(&buf);

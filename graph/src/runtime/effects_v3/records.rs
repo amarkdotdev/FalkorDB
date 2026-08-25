@@ -14,11 +14,12 @@ use super::*;
 /// opcode.
 fn write_header(
     buf: &mut Vec<u8>,
-    opcode: u32,
+    opcode: Opcode,
     count: usize,
 ) {
+    debug_assert!(opcode.is_batchable(), "{opcode:?} carries no count");
     debug_assert!(count <= u32::MAX as usize, "record count must fit in u32");
-    write_u32(buf, opcode);
+    write_u32(buf, opcode.as_u32());
     write_u32(buf, count as u32);
 }
 
@@ -33,7 +34,7 @@ pub fn write_create_node(
     attr_ids: &[u16],
     rows: &[Value],
 ) {
-    write_header(buf, EFFECT_CREATE_NODE, ids.len());
+    write_header(buf, Opcode::CreateNode, ids.len());
     write_id_set(buf, ids);
     write_label_set(buf, labels);
     write_attr_set(buf, attr_ids, rows);
@@ -54,7 +55,7 @@ pub fn write_create_edge(
 ) {
     debug_assert_eq!(ids.len(), src.len(), "one source per edge");
     debug_assert_eq!(ids.len(), dst.len(), "one destination per edge");
-    write_header(buf, EFFECT_CREATE_EDGE, ids.len());
+    write_header(buf, Opcode::CreateEdge, ids.len());
     write_id_set(buf, ids);
     write_rel_type(buf, relation_id);
     write_id_list(buf, src);
@@ -73,11 +74,7 @@ pub fn write_update(
     attr_ids: &[u16],
     rows: &[Value],
 ) {
-    write_header(
-        buf,
-        entity.pick(EFFECT_UPDATE_NODE, EFFECT_UPDATE_EDGE),
-        ids.len(),
-    );
+    write_header(buf, entity.update_opcode(), ids.len());
     write_id_set(buf, ids);
     write_attr_set(buf, attr_ids, rows);
 }
@@ -87,7 +84,7 @@ pub fn write_delete_node(
     buf: &mut Vec<u8>,
     ids: &[u64],
 ) {
-    write_header(buf, EFFECT_DELETE_NODE, ids.len());
+    write_header(buf, Opcode::DeleteNode, ids.len());
     write_id_set(buf, ids);
 }
 
@@ -104,7 +101,7 @@ pub fn write_delete_edge(
 ) {
     debug_assert_eq!(ids.len(), src.len(), "one source per edge");
     debug_assert_eq!(ids.len(), dst.len(), "one destination per edge");
-    write_header(buf, EFFECT_DELETE_EDGE, ids.len());
+    write_header(buf, Opcode::DeleteEdge, ids.len());
     write_id_set(buf, ids);
     write_rel_type(buf, relation_id);
     write_id_list(buf, src);
@@ -125,9 +122,9 @@ pub fn write_labels(
     labels: &[i32],
 ) {
     let opcode = if add {
-        EFFECT_SET_LABELS
+        Opcode::SetLabels
     } else {
-        EFFECT_REMOVE_LABELS
+        Opcode::RemoveLabels
     };
     write_header(buf, opcode, ids.len());
     write_id_set(buf, ids);
@@ -142,12 +139,12 @@ pub fn write_labels(
 /// computes the id it would assign and rejects the buffer if it disagrees.
 pub fn write_add_schema(
     buf: &mut Vec<u8>,
-    schema_type: u32,
+    schema_type: SchemaType,
     id: i32,
     name: &str,
 ) {
-    write_u32(buf, EFFECT_ADD_SCHEMA);
-    write_u32(buf, schema_type);
+    write_u32(buf, Opcode::AddSchema.as_u32());
+    write_u32(buf, schema_type.as_u32());
     write_label_id(buf, id);
     write_string(buf, name);
 }
@@ -165,7 +162,7 @@ pub fn write_add_attribute(
     id: u16,
     name: &str,
 ) {
-    write_u32(buf, EFFECT_ADD_ATTRIBUTE);
+    write_u32(buf, Opcode::AddAttribute.as_u32());
     write_u16(buf, id);
     write_string(buf, name);
 }
@@ -195,14 +192,14 @@ pub struct IndexField<'a> {
 /// disagreement into a loud failure rather than a write to the wrong attribute.
 pub fn write_create_index(
     buf: &mut Vec<u8>,
-    schema_type: u32,
+    schema_type: SchemaType,
     label_id: i32,
     label: &str,
     field: IndexField<'_>,
     options: &Value,
 ) {
-    write_u32(buf, EFFECT_CREATE_INDEX);
-    write_u32(buf, schema_type);
+    write_u32(buf, Opcode::CreateIndex.as_u32());
+    write_u32(buf, schema_type.as_u32());
     write_label_id(buf, label_id);
     write_string(buf, label);
     write_u16(buf, field.attr_id);
@@ -214,13 +211,13 @@ pub fn write_create_index(
 /// `12 DROP_INDEX` — mirrors [`write_create_index`] without the options.
 pub fn write_drop_index(
     buf: &mut Vec<u8>,
-    schema_type: u32,
+    schema_type: SchemaType,
     label_id: i32,
     label: &str,
     field: IndexField<'_>,
 ) {
-    write_u32(buf, EFFECT_DROP_INDEX);
-    write_u32(buf, schema_type);
+    write_u32(buf, Opcode::DropIndex.as_u32());
+    write_u32(buf, schema_type.as_u32());
     write_label_id(buf, label_id);
     write_string(buf, label);
     write_u16(buf, field.attr_id);
@@ -236,8 +233,8 @@ pub fn write_drop_index(
 pub fn write_constraint(
     buf: &mut Vec<u8>,
     create: bool,
-    constraint_type: u32,
-    entity_type: u32,
+    constraint_type: ConstraintKind,
+    entity_type: GraphEntity,
     label_id: i32,
     label: &str,
     props: &[(u16, &str)],
@@ -249,39 +246,19 @@ pub fn write_constraint(
     write_u32(
         buf,
         if create {
-            EFFECT_CREATE_CONSTRAINT
+            Opcode::CreateConstraint.as_u32()
         } else {
-            EFFECT_DROP_CONSTRAINT
+            Opcode::DropConstraint.as_u32()
         },
     );
-    write_u32(buf, constraint_type);
-    write_u32(buf, entity_type);
+    write_u32(buf, constraint_type.as_u32());
+    write_u32(buf, entity_type.as_u32());
     write_label_id(buf, label_id);
     write_string(buf, label);
     write_u8(buf, props.len() as u8);
     for (attr_id, name) in props {
         write_u16(buf, *attr_id);
         write_string(buf, name);
-    }
-}
-
-/// Which entity kind an update targets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GraphEntity {
-    Node,
-    Edge,
-}
-
-impl GraphEntity {
-    const fn pick(
-        self,
-        node: u32,
-        edge: u32,
-    ) -> u32 {
-        match self {
-            Self::Node => node,
-            Self::Edge => edge,
-        }
     }
 }
 
@@ -323,7 +300,7 @@ pub enum Record {
         labels: Vec<i32>,
     },
     AddSchema {
-        schema_type: u32,
+        schema_type: SchemaType,
         id: i32,
         name: String,
     },
@@ -333,7 +310,7 @@ pub enum Record {
     },
     Index {
         create: bool,
-        schema_type: u32,
+        schema_type: SchemaType,
         label_id: i32,
         label: String,
         attr_id: u16,
@@ -344,8 +321,8 @@ pub enum Record {
     },
     Constraint {
         create: bool,
-        constraint_type: u32,
-        entity_type: u32,
+        constraint_type: ConstraintKind,
+        entity_type: GraphEntity,
         label_id: i32,
         label: String,
         props: Vec<(u16, String)>,
@@ -354,78 +331,21 @@ pub enum Record {
 
 /// Read one record, whatever its opcode.
 pub fn read_record(r: &mut Reader<'_>) -> Result<Record, DecodeError> {
-    let opcode = r.u32()?;
-    // The singular records carry no count, so read them before asking for one.
-    match opcode {
-        EFFECT_ADD_SCHEMA => {
-            let schema_type = r.u32()?;
-            let id = r.i32()?;
-            return Ok(Record::AddSchema {
-                schema_type,
-                id,
-                name: r.string()?,
-            });
-        }
-        EFFECT_ADD_ATTRIBUTE => {
-            let id = r.u16()?;
-            return Ok(Record::AddAttribute {
-                id,
-                name: r.string()?,
-            });
-        }
-        EFFECT_CREATE_INDEX | EFFECT_DROP_INDEX => {
-            let create = opcode == EFFECT_CREATE_INDEX;
-            let schema_type = r.u32()?;
-            let label_id = r.i32()?;
-            let label = r.string()?;
-            let attr_id = r.u16()?;
-            let attr = r.string()?;
-            let field_type = r.u32()?;
-            let options = if create { Some(read_value(r)?) } else { None };
-            return Ok(Record::Index {
-                create,
-                schema_type,
-                label_id,
-                label,
-                attr_id,
-                attr,
-                field_type,
-                options,
-            });
-        }
-        EFFECT_CREATE_CONSTRAINT | EFFECT_DROP_CONSTRAINT => {
-            let create = opcode == EFFECT_CREATE_CONSTRAINT;
-            let constraint_type = r.u32()?;
-            let entity_type = r.u32()?;
-            let label_id = r.i32()?;
-            let label = r.string()?;
-            let n = r.u8()?;
-            // Each pair is at least 2 bytes of id plus an 8-byte length.
-            let n = r.guard_count(u64::from(n), 10)?;
-            let mut props = Vec::with_capacity(n);
-            for _ in 0..n {
-                let attr_id = r.u16()?;
-                props.push((attr_id, r.string()?));
-            }
-            return Ok(Record::Constraint {
-                create,
-                constraint_type,
-                entity_type,
-                label_id,
-                label,
-                props,
-            });
-        }
-        _ => {}
+    let opcode = Opcode::try_from(r.u32()?)?;
+
+    // The singular records carry no count, so they are read before one is asked
+    // for. `is_batchable` is the same predicate the writer asserts on.
+    if !opcode.is_batchable() {
+        return read_singular(r, opcode);
     }
 
     let count = r.u32()?;
     let record = match opcode {
-        EFFECT_UPDATE_NODE | EFFECT_UPDATE_EDGE => {
+        Opcode::UpdateNode | Opcode::UpdateEdge => {
             let ids = read_id_set(r, count)?;
             let (attr_ids, rows) = read_attr_set(r, count)?;
             Record::Update {
-                entity: if opcode == EFFECT_UPDATE_NODE {
+                entity: if opcode == Opcode::UpdateNode {
                     GraphEntity::Node
                 } else {
                     GraphEntity::Edge
@@ -435,7 +355,7 @@ pub fn read_record(r: &mut Reader<'_>) -> Result<Record, DecodeError> {
                 rows,
             }
         }
-        EFFECT_CREATE_NODE => {
+        Opcode::CreateNode => {
             let ids = read_id_set(r, count)?;
             let labels = read_label_set(r)?;
             let (attr_ids, rows) = read_attr_set(r, count)?;
@@ -446,7 +366,7 @@ pub fn read_record(r: &mut Reader<'_>) -> Result<Record, DecodeError> {
                 rows,
             }
         }
-        EFFECT_CREATE_EDGE => {
+        Opcode::CreateEdge => {
             let ids = read_id_set(r, count)?;
             let relation_id = read_rel_type(r)?;
             let src = read_id_list(r, count)?;
@@ -461,10 +381,10 @@ pub fn read_record(r: &mut Reader<'_>) -> Result<Record, DecodeError> {
                 rows,
             }
         }
-        EFFECT_DELETE_NODE => Record::DeleteNode {
+        Opcode::DeleteNode => Record::DeleteNode {
             ids: read_id_set(r, count)?,
         },
-        EFFECT_DELETE_EDGE => {
+        Opcode::DeleteEdge => {
             let ids = read_id_set(r, count)?;
             let relation_id = read_rel_type(r)?;
             let src = read_id_list(r, count)?;
@@ -476,14 +396,91 @@ pub fn read_record(r: &mut Reader<'_>) -> Result<Record, DecodeError> {
                 dst,
             }
         }
-        EFFECT_SET_LABELS | EFFECT_REMOVE_LABELS => Record::Labels {
-            add: opcode == EFFECT_SET_LABELS,
+        Opcode::SetLabels | Opcode::RemoveLabels => Record::Labels {
+            add: opcode == Opcode::SetLabels,
             ids: read_id_set(r, count)?,
             labels: read_label_set(r)?,
         },
-        other => return Err(DecodeError::BadOpcode(other)),
+        // Every remaining opcode answered false to `is_batchable` and was
+        // handled above. Listing them keeps the match exhaustive, so a new
+        // record type stops compiling here until it is decided which it is.
+        Opcode::AddSchema
+        | Opcode::AddAttribute
+        | Opcode::CreateIndex
+        | Opcode::DropIndex
+        | Opcode::CreateConstraint
+        | Opcode::DropConstraint => unreachable!("handled by read_singular"),
     };
     Ok(record)
+}
+
+/// The records that describe one thing and so carry no count.
+fn read_singular(
+    r: &mut Reader<'_>,
+    opcode: Opcode,
+) -> Result<Record, DecodeError> {
+    Ok(match opcode {
+        Opcode::AddSchema => {
+            let schema_type = SchemaType::try_from(r.u32()?)?;
+            let id = r.i32()?;
+            Record::AddSchema {
+                schema_type,
+                id,
+                name: r.string()?,
+            }
+        }
+        Opcode::AddAttribute => {
+            let id = r.u16()?;
+            Record::AddAttribute {
+                id,
+                name: r.string()?,
+            }
+        }
+        Opcode::CreateIndex | Opcode::DropIndex => {
+            let create = opcode == Opcode::CreateIndex;
+            let schema_type = SchemaType::try_from(r.u32()?)?;
+            let label_id = r.i32()?;
+            let label = r.string()?;
+            let attr_id = r.u16()?;
+            let attr = r.string()?;
+            let field_type = r.u32()?;
+            let options = if create { Some(read_value(r)?) } else { None };
+            Record::Index {
+                create,
+                schema_type,
+                label_id,
+                label,
+                attr_id,
+                attr,
+                field_type,
+                options,
+            }
+        }
+        Opcode::CreateConstraint | Opcode::DropConstraint => {
+            let create = opcode == Opcode::CreateConstraint;
+            let constraint_type = ConstraintKind::try_from(r.u32()?)?;
+            let entity_type = GraphEntity::try_from(r.u32()?)?;
+            let label_id = r.i32()?;
+            let label = r.string()?;
+            let n = r.u8()?;
+            // Each pair is at least 2 bytes of id plus an 8-byte length.
+            let n = r.guard_count(u64::from(n), 10)?;
+            let mut props = Vec::with_capacity(n);
+            for _ in 0..n {
+                let attr_id = r.u16()?;
+                props.push((attr_id, r.string()?));
+            }
+            Record::Constraint {
+                create,
+                constraint_type,
+                entity_type,
+                label_id,
+                label,
+                props,
+            }
+        }
+        other => unreachable!("{other:?} is batchable"),
+    })
 }
 
 /// Read a whole `GRAPH.EFFECT` payload: the version byte, then every record.
@@ -537,10 +534,10 @@ mod tests {
         let mut buf = new_buffer();
         write_create_node(&mut buf, &ids, &[7], &[0], &rows);
 
-        assert_eq!(&buf[1..5], &EFFECT_CREATE_NODE.to_le_bytes());
+        assert_eq!(&buf[1..5], &Opcode::CreateNode.as_u32().to_le_bytes());
         assert_eq!(&buf[5..9], &10_000_u32.to_le_bytes());
         // 10,000 consecutive ids collapse to one roaring run.
-        assert_eq!(buf[9], ENC_COMPRESSED);
+        assert_eq!(buf[9], BlockEncoding::Compressed.as_u8());
 
         let records = read_buffer(&buf).unwrap();
         assert_eq!(records.len(), 1);
@@ -607,7 +604,7 @@ mod tests {
         // id from its own append order — the assumption every bare id rests on,
         // and the only one that could not be checked.
         let mut buf = new_buffer();
-        write_add_schema(&mut buf, SCHEMA_NODE, 3, "Person");
+        write_add_schema(&mut buf, SchemaType::Node, 3, "Person");
         write_add_attribute(&mut buf, 9, "name");
 
         let records = read_buffer(&buf).unwrap();
@@ -615,7 +612,7 @@ mod tests {
             records,
             vec![
                 Record::AddSchema {
-                    schema_type: SCHEMA_NODE,
+                    schema_type: SchemaType::Node,
                     id: 3,
                     name: "Person".into(),
                 },
@@ -634,14 +631,14 @@ mod tests {
         let mut buf = Vec::new();
         write_add_attribute(&mut buf, 9, "n");
         // opcode, then the id straight away — no 4-byte count in between.
-        assert_eq!(&buf[..4], &EFFECT_ADD_ATTRIBUTE.to_le_bytes());
+        assert_eq!(&buf[..4], &Opcode::AddAttribute.as_u32().to_le_bytes());
         assert_eq!(&buf[4..6], &9_u16.to_le_bytes());
     }
 
     #[test]
     fn every_record_type_round_trips() {
         let mut buf = new_buffer();
-        write_add_schema(&mut buf, SCHEMA_EDGE, 1, "KNOWS");
+        write_add_schema(&mut buf, SchemaType::Edge, 1, "KNOWS");
         write_add_attribute(&mut buf, 0, "since");
         write_create_node(&mut buf, &[1, 2], &[7], &[0], &[Value::Int(1), Value::Null]);
         write_create_edge(
@@ -661,7 +658,7 @@ mod tests {
         write_delete_node(&mut buf, &[1, 2]);
         write_create_index(
             &mut buf,
-            SCHEMA_NODE,
+            SchemaType::Node,
             7,
             "L",
             IndexField {
@@ -673,7 +670,7 @@ mod tests {
         );
         write_drop_index(
             &mut buf,
-            SCHEMA_NODE,
+            SchemaType::Node,
             7,
             "L",
             IndexField {
@@ -685,13 +682,21 @@ mod tests {
         write_constraint(
             &mut buf,
             true,
-            CT_UNIQUE,
-            GETYPE_NODE,
+            ConstraintKind::Unique,
+            GraphEntity::Node,
             7,
             "L",
             &[(0, "since")],
         );
-        write_constraint(&mut buf, false, CT_MANDATORY, GETYPE_EDGE, 1, "KNOWS", &[]);
+        write_constraint(
+            &mut buf,
+            false,
+            ConstraintKind::Mandatory,
+            GraphEntity::Edge,
+            1,
+            "KNOWS",
+            &[],
+        );
 
         let records = read_buffer(&buf).unwrap();
         assert_eq!(records.len(), 14, "one command, fourteen records");
@@ -908,8 +913,8 @@ mod tests {
         assert_eq!(INDEX_FLD_FULLTEXT, 0x01);
         assert_eq!(INDEX_FLD_VECTOR, 0x10);
         // And entity types are 1-based, because GETYPE_UNKNOWN takes 0.
-        assert_eq!(GETYPE_NODE, 1);
-        assert_eq!(GETYPE_EDGE, 2);
+        assert_eq!(GraphEntity::Node.as_u32(), 1);
+        assert_eq!(GraphEntity::Edge.as_u32(), 2);
     }
 
     #[test]
@@ -917,7 +922,7 @@ mod tests {
         let mut buf = new_buffer();
         write_create_index(
             &mut buf,
-            SCHEMA_NODE,
+            SchemaType::Node,
             3,
             "Person",
             IndexField {
@@ -932,7 +937,7 @@ mod tests {
             records[0],
             Record::Index {
                 create: true,
-                schema_type: SCHEMA_NODE,
+                schema_type: SchemaType::Node,
                 label_id: 3,
                 label: "Person".into(),
                 attr_id: 9,
@@ -951,7 +956,7 @@ mod tests {
         for (attr_id, attr) in [(0_u16, "a"), (1, "b"), (2, "c")] {
             write_create_index(
                 &mut buf,
-                SCHEMA_NODE,
+                SchemaType::Node,
                 1,
                 "L",
                 IndexField {
@@ -970,7 +975,7 @@ mod tests {
         let mut buf = new_buffer();
         write_drop_index(
             &mut buf,
-            SCHEMA_EDGE,
+            SchemaType::Edge,
             1,
             "KNOWS",
             IndexField {
@@ -997,8 +1002,8 @@ mod tests {
         write_constraint(
             &mut buf,
             true,
-            CT_UNIQUE,
-            GETYPE_NODE,
+            ConstraintKind::Unique,
+            GraphEntity::Node,
             3,
             "Person",
             &[(0, "first"), (1, "last")],
@@ -1014,8 +1019,8 @@ mod tests {
         write_constraint(
             &mut buf,
             true,
-            CT_UNIQUE,
-            GETYPE_NODE,
+            ConstraintKind::Unique,
+            GraphEntity::Node,
             3,
             "Person",
             &[(0, "first"), (1, "last")],
@@ -1023,8 +1028,8 @@ mod tests {
         write_constraint(
             &mut buf,
             false,
-            CT_MANDATORY,
-            GETYPE_EDGE,
+            ConstraintKind::Mandatory,
+            GraphEntity::Edge,
             1,
             "KNOWS",
             &[(2, "since")],
@@ -1035,8 +1040,8 @@ mod tests {
             records[0],
             Record::Constraint {
                 create: true,
-                constraint_type: CT_UNIQUE,
-                entity_type: GETYPE_NODE,
+                constraint_type: ConstraintKind::Unique,
+                entity_type: GraphEntity::Node,
                 label_id: 3,
                 label: "Person".into(),
                 props: vec![(0, "first".into()), (1, "last".into())],
@@ -1052,7 +1057,7 @@ mod tests {
             panic!("wrong record");
         };
         assert!(!create);
-        assert_eq!(*entity_type, GETYPE_EDGE);
+        assert_eq!(*entity_type, GraphEntity::Edge);
         assert_eq!(props, &vec![(2_u16, "since".to_string())]);
     }
 
@@ -1062,7 +1067,7 @@ mod tests {
         let mut buf = Vec::new();
         write_drop_index(
             &mut buf,
-            SCHEMA_NODE,
+            SchemaType::Node,
             1,
             "L",
             IndexField {
@@ -1071,10 +1076,10 @@ mod tests {
                 field_type: INDEX_FLD_RANGE,
             },
         );
-        assert_eq!(&buf[..4], &EFFECT_DROP_INDEX.to_le_bytes());
+        assert_eq!(&buf[..4], &Opcode::DropIndex.as_u32().to_le_bytes());
         assert_eq!(
             &buf[4..8],
-            &SCHEMA_NODE.to_le_bytes(),
+            &SchemaType::Node.as_u32().to_le_bytes(),
             "schema type, not a count"
         );
     }

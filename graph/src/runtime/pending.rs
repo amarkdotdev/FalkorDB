@@ -1707,7 +1707,7 @@ impl Pending {
                 .enumerate()
                 .skip(self.schema_label_count)
             {
-                v3::write_add_schema(buf, v3::SCHEMA_NODE, offset as i32, label);
+                v3::write_add_schema(buf, v3::SchemaType::Node, offset as i32, label);
                 n_effects += 1;
             }
             for (offset, rel_type) in graph
@@ -1716,7 +1716,7 @@ impl Pending {
                 .enumerate()
                 .skip(self.schema_rel_type_count)
             {
-                v3::write_add_schema(buf, v3::SCHEMA_EDGE, offset as i32, rel_type);
+                v3::write_add_schema(buf, v3::SchemaType::Edge, offset as i32, rel_type);
                 n_effects += 1;
             }
             // Once, not once per entity kind. #2459 unified the two attribute
@@ -2434,7 +2434,7 @@ mod v3_tests {
         assert_eq!(
             records[0],
             Record::AddSchema {
-                schema_type: 0,
+                schema_type: crate::runtime::effects_v3::SchemaType::Node,
                 id: 0,
                 name: "L".into()
             }

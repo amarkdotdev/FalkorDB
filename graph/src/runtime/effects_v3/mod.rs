@@ -67,28 +67,116 @@ pub use records::*;
 pub use value::*;
 
 // ── effect types ──
-//
-// C's `EffectType` is an enum, so 4 bytes on the wire, and `EFFECT_UNKNOWN = 0`
-// shifts every discriminant down by one relative to a naive 1-based list.
 
-pub const EFFECT_UPDATE_NODE: u32 = 1;
-pub const EFFECT_UPDATE_EDGE: u32 = 2;
-pub const EFFECT_CREATE_NODE: u32 = 3;
-pub const EFFECT_CREATE_EDGE: u32 = 4;
-pub const EFFECT_DELETE_NODE: u32 = 5;
-pub const EFFECT_DELETE_EDGE: u32 = 6;
-pub const EFFECT_SET_LABELS: u32 = 7;
-pub const EFFECT_REMOVE_LABELS: u32 = 8;
-pub const EFFECT_ADD_SCHEMA: u32 = 9;
-pub const EFFECT_ADD_ATTRIBUTE: u32 = 10;
-pub const EFFECT_CREATE_INDEX: u32 = 11;
-pub const EFFECT_DROP_INDEX: u32 = 12;
-pub const EFFECT_CREATE_CONSTRAINT: u32 = 13;
-pub const EFFECT_DROP_CONSTRAINT: u32 = 14;
+/// What a record is. C's `EffectType`, so 4 bytes on the wire, and
+/// `EFFECT_UNKNOWN = 0` shifts every discriminant down by one relative to a
+/// naive 1-based list.
+///
+/// An enum rather than constants because the set is closed and the decoder
+/// matches it exhaustively: adding a record type stops compiling until every
+/// match handles it, which is the failure mode worth having. The bit-flag sets
+/// below stay constants for the opposite reason — several of those OR together,
+/// which no enum can express.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Opcode {
+    UpdateNode = 1,
+    UpdateEdge = 2,
+    CreateNode = 3,
+    CreateEdge = 4,
+    DeleteNode = 5,
+    DeleteEdge = 6,
+    SetLabels = 7,
+    RemoveLabels = 8,
+    AddSchema = 9,
+    AddAttribute = 10,
+    CreateIndex = 11,
+    DropIndex = 12,
+    CreateConstraint = 13,
+    DropConstraint = 14,
+}
 
-/// C's `SchemaType`.
-pub const SCHEMA_NODE: u32 = 0;
-pub const SCHEMA_EDGE: u32 = 1;
+impl Opcode {
+    /// The wire discriminant.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self as u32
+    }
+
+    /// Whether the record carries a `count` and blocks sized by it.
+    ///
+    /// The schema and DDL records are inherently singular — one schema, one
+    /// name, one index field — so they carry an opcode and no count.
+    #[must_use]
+    pub const fn is_batchable(self) -> bool {
+        matches!(
+            self,
+            Self::UpdateNode
+                | Self::UpdateEdge
+                | Self::CreateNode
+                | Self::CreateEdge
+                | Self::DeleteNode
+                | Self::DeleteEdge
+                | Self::SetLabels
+                | Self::RemoveLabels
+        )
+    }
+}
+
+impl TryFrom<u32> for Opcode {
+    type Error = DecodeError;
+
+    fn try_from(v: u32) -> Result<Self, Self::Error> {
+        Ok(match v {
+            1 => Self::UpdateNode,
+            2 => Self::UpdateEdge,
+            3 => Self::CreateNode,
+            4 => Self::CreateEdge,
+            5 => Self::DeleteNode,
+            6 => Self::DeleteEdge,
+            7 => Self::SetLabels,
+            8 => Self::RemoveLabels,
+            9 => Self::AddSchema,
+            10 => Self::AddAttribute,
+            11 => Self::CreateIndex,
+            12 => Self::DropIndex,
+            13 => Self::CreateConstraint,
+            14 => Self::DropConstraint,
+            other => return Err(DecodeError::BadOpcode(other)),
+        })
+    }
+}
+
+/// Which dictionary a schema record names: C's `SchemaType`.
+///
+/// **Zero-based**, unlike [`GraphEntity`] on the constraint records, which C
+/// numbers from 1. The two are the same distinction with different wire
+/// encodings, and getting them the same way round is not optional.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum SchemaType {
+    Node = 0,
+    Edge = 1,
+}
+
+impl SchemaType {
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
+
+impl TryFrom<u32> for SchemaType {
+    type Error = DecodeError;
+
+    fn try_from(v: u32) -> Result<Self, Self::Error> {
+        match v {
+            0 => Ok(Self::Node),
+            1 => Ok(Self::Edge),
+            other => Err(DecodeError::BadSchemaType(other)),
+        }
+    }
+}
 
 // ── index field types ──
 //
@@ -118,32 +206,118 @@ pub const INDEX_FLD_UNKNOWN: u32 = 0x00;
 /// `INDEX_FLD_NUMERIC | INDEX_FLD_GEO | INDEX_FLD_STR` = `0x0E`.
 pub const INDEX_FLD_RANGE: u32 = INDEX_FLD_NUMERIC | INDEX_FLD_GEO | INDEX_FLD_STR;
 
-// ── constraint types ──
+// ── constraint and entity types ──
 
-pub const CT_UNIQUE: u32 = 0;
-pub const CT_MANDATORY: u32 = 1;
+/// C's `ConstraintType`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ConstraintKind {
+    Unique = 0,
+    Mandatory = 1,
+}
 
-// ── graph entity types ──
-//
-// **1-based**: `GETYPE_UNKNOWN = 0` comes first, so a node is 1 and an edge 2.
-// A 0-based encoding here would silently make every node record read as
-// "unknown" on the C side.
+impl ConstraintKind {
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
 
-pub const GETYPE_UNKNOWN: u32 = 0;
-pub const GETYPE_NODE: u32 = 1;
-pub const GETYPE_EDGE: u32 = 2;
+impl TryFrom<u32> for ConstraintKind {
+    type Error = DecodeError;
+
+    fn try_from(v: u32) -> Result<Self, Self::Error> {
+        match v {
+            0 => Ok(Self::Unique),
+            1 => Ok(Self::Mandatory),
+            other => Err(DecodeError::BadConstraintType(other)),
+        }
+    }
+}
+
+/// C's `GraphEntityType`, **1-based**: `GETYPE_UNKNOWN` takes 0, so a node is 1
+/// and an edge 2. A 0-based encoding here would silently make every node record
+/// read as "unknown" to C.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum GraphEntity {
+    Node = 1,
+    Edge = 2,
+}
+
+impl GraphEntity {
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self as u32
+    }
+
+    /// Which `UPDATE_*` opcode targets this entity kind.
+    #[must_use]
+    pub const fn update_opcode(self) -> Opcode {
+        match self {
+            Self::Node => Opcode::UpdateNode,
+            Self::Edge => Opcode::UpdateEdge,
+        }
+    }
+
+    /// The schema dictionary this entity kind is named in.
+    #[must_use]
+    pub const fn schema_type(self) -> SchemaType {
+        match self {
+            Self::Node => SchemaType::Node,
+            Self::Edge => SchemaType::Edge,
+        }
+    }
+}
+
+impl TryFrom<u32> for GraphEntity {
+    type Error = DecodeError;
+
+    fn try_from(v: u32) -> Result<Self, Self::Error> {
+        match v {
+            1 => Ok(Self::Node),
+            2 => Ok(Self::Edge),
+            other => Err(DecodeError::BadEntityType(other)),
+        }
+    }
+}
 
 // ── block encodings ──
 
-/// Raw ids at the narrowest width that holds the largest of them:
-/// `u8 width` then `uint(width) x count`.
-///
-/// A separate full-width encoding would be this one with `width == 8`, so there
-/// is no reason for both. Finding the maximum is one pass and no allocation.
-pub const ENC_PLAIN: u8 = 0;
-/// `IdSet`: a run-optimized roaring64 bitmap. `IdList`: a roaring64 dictionary
-/// plus one rank per row.
-pub const ENC_COMPRESSED: u8 = 1;
+/// How an `IdSet` or `IdList` stores its ids.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BlockEncoding {
+    /// Raw ids at the narrowest width that holds the largest of them:
+    /// `u8 width` then `uint(width) x count`.
+    ///
+    /// A separate full-width encoding would be this one with `width == 8`, so
+    /// there is no reason for both. Finding the maximum is one pass and no
+    /// allocation.
+    Plain = 0,
+    /// `IdSet`: a run-optimized roaring64 bitmap. `IdList`: a roaring64
+    /// dictionary plus one rank per row.
+    Compressed = 1,
+}
+
+impl BlockEncoding {
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+impl TryFrom<u8> for BlockEncoding {
+    type Error = DecodeError;
+
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
+        match v {
+            0 => Ok(Self::Plain),
+            1 => Ok(Self::Compressed),
+            other => Err(DecodeError::BadEncoding(other)),
+        }
+    }
+}
 
 // ── SIValue type tags ──
 //

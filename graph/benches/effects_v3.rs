@@ -22,8 +22,8 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use std::hint::black_box;
 
 use graph::runtime::effects_v3::{
-    ENC_COMPRESSED, ENC_PLAIN, Reader, read_id_list, read_id_set, write_id_list,
-    write_id_list_forced, write_id_set,
+    BlockEncoding, Reader, read_id_list, read_id_set, write_id_list, write_id_list_forced,
+    write_id_set,
 };
 
 /// `rows` endpoints drawn from `distinct` sources inside a graph of `nodes`
@@ -47,7 +47,10 @@ fn endpoints(
         .collect()
 }
 
-const ENCODINGS: [(&str, u8); 2] = [("raw", ENC_PLAIN), ("dictionary", ENC_COMPRESSED)];
+const ENCODINGS: [(&str, BlockEncoding); 2] = [
+    ("raw", BlockEncoding::Plain),
+    ("dictionary", BlockEncoding::Compressed),
+];
 
 /// The shapes the selection table shows a real winner for.
 const SHAPES: [(u64, usize); 4] = [

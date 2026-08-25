@@ -27,8 +27,8 @@ use crate::{
     index::{IndexType, indexer::IndexOptions},
     runtime::{
         effects_v3::{
-            self as v3, DecodeError, GETYPE_EDGE, GETYPE_NODE, GraphEntity, INDEX_FLD_FULLTEXT,
-            INDEX_FLD_VECTOR, Record, SCHEMA_EDGE, SCHEMA_NODE,
+            ConstraintKind, DecodeError, GraphEntity, INDEX_FLD_FULLTEXT, INDEX_FLD_VECTOR, Record,
+            SchemaType, read_buffer,
         },
         runtime::map_to_index_options,
         value::Value,
@@ -149,7 +149,7 @@ pub fn apply_effects_v3(
     g: &mut Graph,
     buf: &[u8],
 ) -> Result<(), ApplyError> {
-    let records = v3::read_buffer(buf)?;
+    let records = read_buffer(buf)?;
     let mut ops = IndexOps::default();
 
     for record in records {
@@ -295,7 +295,7 @@ fn apply_record(
         } => {
             verify_schema(g, schema_type, label_id, &label)?;
             verify_attribute(g, attr_id, &attr)?;
-            let entity_type = entity_type_of(schema_type)?;
+            let entity_type = entity_type_of(schema_type);
             let index_type = index_type_of(field_type);
             let label = Arc::new(label);
             let fields = vec![Arc::new(attr)];
@@ -324,18 +324,14 @@ fn apply_record(
             label,
             props,
         } => {
-            let schema_type = if entity_type == GETYPE_EDGE {
-                SCHEMA_EDGE
-            } else {
-                SCHEMA_NODE
-            };
+            let schema_type = entity_type.schema_type();
             verify_schema(g, schema_type, label_id, &label)?;
             for (attr_id, name) in &props {
                 verify_attribute(g, *attr_id, name)?;
             }
 
-            let ct = constraint_type_of(constraint_type)?;
-            let et = entity_type_of(schema_type)?;
+            let ct = constraint_type_of(constraint_type);
+            let et = entity_type_of(schema_type);
             let properties: Vec<Arc<String>> =
                 props.into_iter().map(|(_, n)| Arc::new(n)).collect();
 
@@ -356,25 +352,21 @@ fn apply_record(
 /// `ADD_SCHEMA`: register the label or type, then check the id matches.
 fn apply_add_schema(
     g: &mut Graph,
-    schema_type: u32,
+    schema_type: SchemaType,
     id: i32,
     name: &str,
 ) -> Result<(), ApplyError> {
     match schema_type {
-        SCHEMA_NODE => {
+        SchemaType::Node => {
             let assigned = usize::from(g.get_label_id_mut(name)) as i64;
             let local = g.get_labels().get(id as usize).map(|l| l.to_string());
             verify_id("label", name, i64::from(id), assigned, local)
         }
-        SCHEMA_EDGE => {
+        SchemaType::Edge => {
             let assigned = g.get_type_id_mut(name).0 as i64;
             let local = g.get_types().get(id as usize).map(|t| t.to_string());
             verify_id("relationship type", name, i64::from(id), assigned, local)
         }
-        other => Err(ApplyError::UnknownDiscriminant {
-            kind: "schema type",
-            value: other,
-        }),
     }
 }
 
@@ -404,25 +396,19 @@ fn verify_id(
 /// divergence instead of writing through a stale id. Mirrors C's `VerifySchema`.
 fn verify_schema(
     g: &Graph,
-    schema_type: u32,
+    schema_type: SchemaType,
     id: i32,
     name: &str,
 ) -> Result<(), ApplyError> {
     let (kind, local) = match schema_type {
-        SCHEMA_NODE => (
+        SchemaType::Node => (
             "label",
             g.get_labels().get(id as usize).map(|l| l.to_string()),
         ),
-        SCHEMA_EDGE => (
+        SchemaType::Edge => (
             "relationship type",
             g.get_types().get(id as usize).map(|t| t.to_string()),
         ),
-        other => {
-            return Err(ApplyError::UnknownDiscriminant {
-                kind: "schema type",
-                value: other,
-            });
-        }
     };
     resolved(kind, name, i64::from(id), local)
 }
@@ -566,14 +552,12 @@ fn index_options(
     }
 }
 
-fn entity_type_of(schema_type: u32) -> Result<EntityType, ApplyError> {
+/// Total now that the wire type is an enum — the codec rejected anything else
+/// before this path saw it.
+const fn entity_type_of(schema_type: SchemaType) -> EntityType {
     match schema_type {
-        SCHEMA_NODE => Ok(EntityType::Node),
-        SCHEMA_EDGE => Ok(EntityType::Relationship),
-        other => Err(ApplyError::UnknownDiscriminant {
-            kind: "schema type",
-            value: other,
-        }),
+        SchemaType::Node => EntityType::Node,
+        SchemaType::Edge => EntityType::Relationship,
     }
 }
 
@@ -590,25 +574,21 @@ fn index_type_of(field_type: u32) -> IndexType {
     }
 }
 
-fn constraint_type_of(ct: u32) -> Result<ConstraintType, ApplyError> {
+const fn constraint_type_of(ct: ConstraintKind) -> ConstraintType {
     match ct {
-        v3::CT_UNIQUE => Ok(ConstraintType::Unique),
-        v3::CT_MANDATORY => Ok(ConstraintType::Mandatory),
-        other => Err(ApplyError::UnknownDiscriminant {
-            kind: "constraint type",
-            value: other,
-        }),
+        ConstraintKind::Unique => ConstraintType::Unique,
+        ConstraintKind::Mandatory => ConstraintType::Mandatory,
     }
 }
 
-/// `GETYPE_*` is 1-based on the wire; this keeps the compiler honest about it.
-const _: () = assert!(GETYPE_NODE == 1 && GETYPE_EDGE == 2);
+/// `GraphEntity` is 1-based on the wire; this keeps the compiler honest.
+const _: () = assert!(GraphEntity::Node.as_u32() == 1 && GraphEntity::Edge.as_u32() == 2);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::effects_v3::{
-        CT_UNIQUE, INDEX_FLD_RANGE, IndexField, new_buffer, write_add_attribute, write_add_schema,
+        INDEX_FLD_RANGE, IndexField, new_buffer, write_add_attribute, write_add_schema,
         write_constraint, write_create_index, write_create_node, write_labels,
     };
 
@@ -621,7 +601,7 @@ mod tests {
     fn a_buffer_applies_end_to_end() {
         let mut g = graph();
         let mut buf = new_buffer();
-        write_add_schema(&mut buf, SCHEMA_NODE, 0, "Person");
+        write_add_schema(&mut buf, SchemaType::Node, 0, "Person");
         write_add_attribute(&mut buf, 0, "name");
         write_create_node(
             &mut buf,
@@ -649,7 +629,7 @@ mod tests {
         g.get_label_id_mut("Existing");
 
         let mut buf = new_buffer();
-        write_add_schema(&mut buf, SCHEMA_NODE, 0, "Person");
+        write_add_schema(&mut buf, SchemaType::Node, 0, "Person");
 
         let err = apply_effects_v3(&mut g, &buf).expect_err("must refuse");
         assert!(
@@ -699,7 +679,7 @@ mod tests {
         let mut buf = new_buffer();
         write_create_index(
             &mut buf,
-            SCHEMA_NODE,
+            SchemaType::Node,
             0,
             "Expected",
             IndexField {
@@ -721,7 +701,7 @@ mod tests {
     fn labels_apply_to_every_node_in_the_record() {
         let mut g = graph();
         let mut buf = new_buffer();
-        write_add_schema(&mut buf, SCHEMA_NODE, 0, "L");
+        write_add_schema(&mut buf, SchemaType::Node, 0, "L");
         write_create_node(&mut buf, &[0, 1, 2, 3], &[], &[], &[]);
         write_labels(&mut buf, true, &[0, 1, 2, 3], &[0]);
 
@@ -736,13 +716,13 @@ mod tests {
         // legitimately reach a different status.
         let mut g = graph();
         let mut buf = new_buffer();
-        write_add_schema(&mut buf, SCHEMA_NODE, 0, "Person");
+        write_add_schema(&mut buf, SchemaType::Node, 0, "Person");
         write_add_attribute(&mut buf, 0, "email");
         write_constraint(
             &mut buf,
             true,
-            CT_UNIQUE,
-            GETYPE_NODE,
+            ConstraintKind::Unique,
+            GraphEntity::Node,
             0,
             "Person",
             &[(0, "email")],
@@ -756,7 +736,7 @@ mod tests {
     fn a_malformed_buffer_is_refused_not_applied() {
         let mut g = graph();
         let mut buf = new_buffer();
-        write_add_schema(&mut buf, SCHEMA_NODE, 0, "L");
+        write_add_schema(&mut buf, SchemaType::Node, 0, "L");
         write_create_node(&mut buf, &[0, 1], &[0], &[], &[]);
 
         for cut in 2..buf.len() {
@@ -801,7 +781,7 @@ mod tests {
         let mut buf = Vec::new();
         p.build_effects_buffer_v3(&master, &mut buf);
         assert_eq!(
-            v3::read_buffer(&buf).unwrap().len(),
+            read_buffer(&buf).unwrap().len(),
             5,
             "2 schema + 1 attr + 2 shapes"
         );
@@ -830,10 +810,13 @@ mod tests {
     #[test]
     fn index_field_type_maps_by_bit_not_ordinal() {
         assert_eq!(index_type_of(INDEX_FLD_RANGE), IndexType::Range);
-        assert_eq!(index_type_of(v3::INDEX_FLD_FULLTEXT), IndexType::Fulltext);
-        assert_eq!(index_type_of(v3::INDEX_FLD_VECTOR), IndexType::Vector);
+        assert_eq!(index_type_of(INDEX_FLD_FULLTEXT), IndexType::Fulltext);
+        assert_eq!(index_type_of(INDEX_FLD_VECTOR), IndexType::Vector);
         // A range index is the OR of three scalar kinds, so bit-testing is the
         // only thing that classifies it correctly.
-        assert_eq!(index_type_of(v3::INDEX_FLD_NUMERIC), IndexType::Range);
+        assert_eq!(
+            index_type_of(crate::runtime::effects_v3::INDEX_FLD_NUMERIC),
+            IndexType::Range
+        );
     }
 }

@@ -59,4 +59,15 @@ pub enum DecodeError {
     /// An opcode with no record shape.
     #[error("unknown effect opcode {0}")]
     BadOpcode(u32),
+
+    #[error("unknown schema type {0}")]
+    BadSchemaType(u32),
+
+    #[error("unknown constraint type {0}")]
+    BadConstraintType(u32),
+
+    /// C numbers `GraphEntityType` from 1, so 0 reaches here as often as a
+    /// genuinely corrupt value does.
+    #[error("unknown graph entity type {0}")]
+    BadEntityType(u32),
 }

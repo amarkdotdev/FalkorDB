@@ -189,7 +189,7 @@ pub fn write_string(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{ENC_PLAIN, read_id_set, write_id_set};
+    use super::super::{BlockEncoding, read_id_set, write_id_set};
     use super::*;
 
     // ── malformed input ──
@@ -210,7 +210,7 @@ mod tests {
     fn an_absurd_count_is_rejected_before_allocating() {
         // A short buffer claiming four billion entries must not try to reserve
         // for them.
-        let buf = [ENC_PLAIN, 8, 0, 0];
+        let buf = [BlockEncoding::Plain.as_u8(), 8, 0, 0];
         let mut r = Reader::new(&buf);
         assert!(matches!(
             read_id_set(&mut r, u32::MAX),
