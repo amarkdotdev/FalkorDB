@@ -47,9 +47,12 @@
 //! carry an opcode but no count. Index and constraint records (11–14) are not
 //! in this module yet.
 
-use std::{fmt, sync::Arc};
+use std::sync::Arc;
 
 use roaring::RoaringTreemap;
+use thiserror::Error;
+
+use crate::graph::graphblas::serialization::{index_field_type, si_type};
 use thin_vec::ThinVec;
 
 use crate::runtime::{
@@ -88,17 +91,29 @@ pub const SCHEMA_EDGE: u32 = 1;
 
 // ── index field types ──
 //
-// `IndexFieldType` is a **bit flag set**, not an ordinal — several can be OR'd
-// together (`index_field.h`). `INDEX_FLD_RANGE` is the union of the three
-// scalar kinds, which is why a range index reads as `0x0E` rather than a
-// discriminant of its own.
+// Also derived from the RDB module's copy of C's `index_field.h`. This is a
+// **bit flag set**, not an ordinal — several can be OR'd — which is why
+// `INDEX_FLD_RANGE` is the union of the three scalar kinds and reads as `0x0E`
+// rather than having a discriminant of its own. A bit set is the one shape an
+// enum genuinely cannot model, so these stay constants.
+
+macro_rules! index_flags {
+    ($($name:ident),* $(,)?) => {
+        $(
+            pub const $name: u32 = index_field_type::$name as u32;
+        )*
+    };
+}
+
+index_flags!(
+    INDEX_FLD_FULLTEXT,
+    INDEX_FLD_NUMERIC,
+    INDEX_FLD_GEO,
+    INDEX_FLD_STR,
+    INDEX_FLD_VECTOR,
+);
 
 pub const INDEX_FLD_UNKNOWN: u32 = 0x00;
-pub const INDEX_FLD_FULLTEXT: u32 = 0x01;
-pub const INDEX_FLD_NUMERIC: u32 = 0x02;
-pub const INDEX_FLD_GEO: u32 = 0x04;
-pub const INDEX_FLD_STR: u32 = 0x08;
-pub const INDEX_FLD_VECTOR: u32 = 0x10;
 /// `INDEX_FLD_NUMERIC | INDEX_FLD_GEO | INDEX_FLD_STR` = `0x0E`.
 pub const INDEX_FLD_RANGE: u32 = INDEX_FLD_NUMERIC | INDEX_FLD_GEO | INDEX_FLD_STR;
 
@@ -131,23 +146,46 @@ pub const ENC_COMPRESSED: u8 = 1;
 
 // ── SIValue type tags ──
 //
+// Derived from `serialization::si_type` rather than restated: the RDB encoder
+// already carries C's tags, and two copies of a bitmask would drift silently —
+// nothing fails when a tag is wrong, the far side just reads the next field as
+// a type. They are `u64` there because RDB writes them through a
+// variable-width `write_unsigned`; the effects wire is a fixed 4 bytes, so
+// these narrow.
+//
 // C's `SIType` is a **bitmask**, not an ordinal: each type is a distinct bit.
-// Rust's own effects codec used sequential 0..12 tags, which collide with these
+// Rust's own v2 codec used sequential 0..12 tags, which collide with these
 // almost everywhere and are the single most dangerous divergence in the format.
 
+macro_rules! si_tags {
+    ($($name:ident),* $(,)?) => {
+        $(
+            pub const $name: u32 = {
+                assert!(si_type::$name <= u32::MAX as u64, "SIType must fit the 4 bytes C reads");
+                si_type::$name as u32
+            };
+        )*
+    };
+}
+
+si_tags!(
+    T_ARRAY,
+    T_DATETIME,
+    T_DATE,
+    T_TIME,
+    T_DURATION,
+    T_STRING,
+    T_BOOL,
+    T_INT64,
+    T_DOUBLE,
+    T_NULL,
+    T_POINT,
+    T_VECTOR_F32,
+);
+
+/// `T_MAP` has no RDB counterpart — the RDB path never stores a bare map — so
+/// unlike the rest it is stated here.
 pub const T_MAP: u32 = 1 << 0;
-pub const T_ARRAY: u32 = 1 << 3;
-pub const T_DATETIME: u32 = 1 << 5;
-pub const T_DATE: u32 = 1 << 7;
-pub const T_TIME: u32 = 1 << 8;
-pub const T_DURATION: u32 = 1 << 10;
-pub const T_STRING: u32 = 1 << 11;
-pub const T_BOOL: u32 = 1 << 12;
-pub const T_INT64: u32 = 1 << 13;
-pub const T_DOUBLE: u32 = 1 << 14;
-pub const T_NULL: u32 = 1 << 15;
-pub const T_POINT: u32 = 1 << 17;
-pub const T_VECTOR_F32: u32 = 1 << 18;
 
 // ── decode errors ──
 
@@ -156,74 +194,55 @@ pub const T_VECTOR_F32: u32 = 1 << 18;
 /// Every variant is fatal for the whole buffer: effects are applied
 /// transactionally, so a record that does not decode means the replica has
 /// diverged and must not apply a partial prefix.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum DecodeError {
     /// Fewer bytes remain than the next field needs.
+    #[error("truncated effects buffer: want {want} bytes, have {have}")]
     UnexpectedEof { want: usize, have: usize },
+
     /// A count would require more bytes than the buffer can possibly hold.
     /// Checked *before* allocating, so a corrupt length cannot OOM us.
+    #[error("effects record claims {count} entries but only {remaining} bytes remain")]
     ImplausibleCount { count: u64, remaining: usize },
+
     /// An encoding discriminator that is neither [`ENC_PLAIN`] nor
     /// [`ENC_COMPRESSED`].
+    #[error("unknown block encoding {0}")]
     BadEncoding(u8),
+
     /// The roaring blob did not deserialize.
+    #[error("malformed roaring bitmap: {0}")]
     BadRoaring(String),
+
     /// The decoded bitmap holds a different number of ids than the record's
     /// count — the guard that keeps row *k* bound to the right entity.
+    #[error("effects record declares {expected} ids but its bitmap holds {actual}")]
     CardinalityMismatch { expected: u64, actual: u64 },
+
     /// An `IdList` rank that does not address the dictionary.
+    #[error("dictionary rank {rank} out of range for {cardinality} entries")]
     RankOutOfRange { rank: u64, cardinality: u64 },
+
     /// An `idx_width` other than 1, 2, 4 or 8.
+    #[error("unsupported index width {0}")]
     BadIndexWidth(u8),
+
     /// An `SIType` bit pattern with no corresponding [`Value`].
+    #[error("unknown SIValue type {0:#x}")]
     BadValueType(u32),
+
     /// A string field that is not valid UTF-8, or is missing its NUL.
+    #[error("malformed string in effects buffer")]
     BadString,
+
     /// A buffer whose version byte this build cannot read.
+    #[error("effects buffer is version {0}, this build reads {EFFECTS_VERSION}")]
     UnsupportedVersion(u8),
+
     /// An opcode with no record shape.
+    #[error("unknown effect opcode {0}")]
     BadOpcode(u32),
 }
-
-impl fmt::Display for DecodeError {
-    fn fmt(
-        &self,
-        f: &mut fmt::Formatter<'_>,
-    ) -> fmt::Result {
-        match self {
-            Self::UnexpectedEof { want, have } => {
-                write!(
-                    f,
-                    "truncated effects buffer: want {want} bytes, have {have}"
-                )
-            }
-            Self::ImplausibleCount { count, remaining } => write!(
-                f,
-                "effects record claims {count} entries but only {remaining} bytes remain"
-            ),
-            Self::BadEncoding(e) => write!(f, "unknown block encoding {e}"),
-            Self::BadRoaring(e) => write!(f, "malformed roaring bitmap: {e}"),
-            Self::CardinalityMismatch { expected, actual } => write!(
-                f,
-                "effects record declares {expected} ids but its bitmap holds {actual}"
-            ),
-            Self::RankOutOfRange { rank, cardinality } => write!(
-                f,
-                "dictionary rank {rank} out of range for {cardinality} entries"
-            ),
-            Self::BadIndexWidth(w) => write!(f, "unsupported index width {w}"),
-            Self::BadValueType(t) => write!(f, "unknown SIValue type {t:#x}"),
-            Self::BadString => write!(f, "malformed string in effects buffer"),
-            Self::UnsupportedVersion(v) => write!(
-                f,
-                "effects buffer is version {v}, this build reads {EFFECTS_VERSION}"
-            ),
-            Self::BadOpcode(o) => write!(f, "unknown effect opcode {o}"),
-        }
-    }
-}
-
-impl std::error::Error for DecodeError {}
 
 // ── reader ──
 

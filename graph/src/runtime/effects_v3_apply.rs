@@ -27,7 +27,7 @@ use crate::{
     index::{IndexType, indexer::IndexOptions},
     runtime::{
         effects_v3::{
-            self as v3, GETYPE_EDGE, GETYPE_NODE, GraphEntity, INDEX_FLD_FULLTEXT,
+            self as v3, DecodeError, GETYPE_EDGE, GETYPE_NODE, GraphEntity, INDEX_FLD_FULLTEXT,
             INDEX_FLD_VECTOR, Record, SCHEMA_EDGE, SCHEMA_NODE,
         },
         runtime::map_to_index_options,
@@ -37,6 +37,98 @@ use crate::{
 use roaring::RoaringTreemap;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
+use thiserror::Error;
+
+/// Why a v3 buffer could not be applied.
+///
+/// Divergence is the interesting half. `Decode` means the bytes were malformed;
+/// everything below it means the bytes were *well formed* and described a graph
+/// this replica does not have — which is the failure v3 exists to make loud.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum ApplyError {
+    #[error(transparent)]
+    Decode(#[from] DecodeError),
+
+    /// The replica would have assigned a different id to a new schema entry or
+    /// attribute. C's reader cannot see this case: it only refuses a name that
+    /// already exists locally, which misses a replica whose dictionary is a
+    /// different length, where appending the same new name yields a different
+    /// id. That is the case that silently put a property value on the wrong
+    /// attribute.
+    #[error(
+        "effects buffer assigns {kind} '{name}' id {expected}, but this replica would \
+         assign {assigned}{local}. The two engines have diverged; the buffer was not applied."
+    )]
+    IdMismatch {
+        kind: &'static str,
+        name: String,
+        expected: i64,
+        assigned: i64,
+        /// What the wire's id names locally, when it names anything.
+        local: LocalName,
+    },
+
+    /// An id resolved, but to a different name. Mirrors C's `VerifySchema` /
+    /// `VerifyAttribute`: the id is authoritative, the name is the cross-check.
+    #[error("effects buffer references {kind} '{name}' (id {id}), which is '{local}' here")]
+    NameMismatch {
+        kind: &'static str,
+        name: String,
+        id: i64,
+        local: String,
+    },
+
+    #[error("effects buffer references {kind} '{name}' (id {id}), which does not exist here")]
+    Unresolved {
+        kind: &'static str,
+        name: String,
+        id: i64,
+    },
+
+    #[error("{kind} id {id} out of range")]
+    IdOutOfRange { kind: &'static str, id: i64 },
+
+    #[error("unknown {kind}: {value}")]
+    UnknownDiscriminant { kind: &'static str, value: u32 },
+
+    #[error("record declares {entities} entities x {width} attributes but carries {values} values")]
+    ShapeMismatch {
+        entities: usize,
+        width: usize,
+        values: usize,
+    },
+
+    #[error("index options must be a map, got {0}")]
+    OptionsNotAMap(String),
+
+    /// The graph rejected the mutation. Still a `String` because that is what
+    /// every `Graph` method returns; wrapping it keeps the apply path's own
+    /// failures distinguishable from the graph's.
+    #[error("{0}")]
+    Graph(String),
+}
+
+impl From<String> for ApplyError {
+    fn from(e: String) -> Self {
+        Self::Graph(e)
+    }
+}
+
+/// What an id names locally, rendered for the `IdMismatch` message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalName(pub Option<String>);
+
+impl std::fmt::Display for LocalName {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        match &self.0 {
+            Some(n) => write!(f, " (that id is '{n}' here)"),
+            None => Ok(()),
+        }
+    }
+}
 
 /// Index bookkeeping that accumulates across a buffer and is committed once.
 #[derive(Default)]
@@ -56,8 +148,8 @@ struct IndexOps {
 pub fn apply_effects_v3(
     g: &mut Graph,
     buf: &[u8],
-) -> Result<(), String> {
-    let records = v3::read_buffer(buf).map_err(|e| e.to_string())?;
+) -> Result<(), ApplyError> {
+    let records = v3::read_buffer(buf)?;
     let mut ops = IndexOps::default();
 
     for record in records {
@@ -76,7 +168,7 @@ fn apply_record(
     g: &mut Graph,
     record: Record,
     ops: &mut IndexOps,
-) -> Result<(), String> {
+) -> Result<(), ApplyError> {
     match record {
         Record::AddSchema {
             schema_type,
@@ -267,7 +359,7 @@ fn apply_add_schema(
     schema_type: u32,
     id: i32,
     name: &str,
-) -> Result<(), String> {
+) -> Result<(), ApplyError> {
     match schema_type {
         SCHEMA_NODE => {
             let assigned = usize::from(g.get_label_id_mut(name)) as i64;
@@ -279,34 +371,31 @@ fn apply_add_schema(
             let local = g.get_types().get(id as usize).map(|t| t.to_string());
             verify_id("relationship type", name, i64::from(id), assigned, local)
         }
-        other => Err(format!("unknown schema type: {other}")),
+        other => Err(ApplyError::UnknownDiscriminant {
+            kind: "schema type",
+            value: other,
+        }),
     }
 }
 
 /// The check v2 could not make.
-///
-/// C's reader has a weaker one — it refuses a name that already exists locally —
-/// which catches a replica that is *ahead* but not one whose dictionary is a
-/// different length, where appending the same new name yields a different id.
-/// That is the case that silently put a property value on the wrong attribute.
 fn verify_id(
-    kind: &str,
+    kind: &'static str,
     name: &str,
     expected: i64,
     assigned: i64,
-    local_name_at_expected: Option<String>,
-) -> Result<(), String> {
+    local: Option<String>,
+) -> Result<(), ApplyError> {
     if assigned == expected {
         return Ok(());
     }
-    Err(format!(
-        "effects buffer assigns {kind} '{name}' id {expected}, but this replica \
-         would assign {assigned}{}. The two engines have diverged; the buffer was \
-         not applied.",
-        local_name_at_expected
-            .map(|n| format!(" (id {expected} is '{n}' here)"))
-            .unwrap_or_default()
-    ))
+    Err(ApplyError::IdMismatch {
+        kind,
+        name: name.to_string(),
+        expected,
+        assigned,
+        local: LocalName(local),
+    })
 }
 
 /// Resolve a label or type by id and confirm the name matches.
@@ -318,21 +407,24 @@ fn verify_schema(
     schema_type: u32,
     id: i32,
     name: &str,
-) -> Result<(), String> {
-    let local = match schema_type {
-        SCHEMA_NODE => g.get_labels().get(id as usize).map(|l| l.to_string()),
-        SCHEMA_EDGE => g.get_types().get(id as usize).map(|t| t.to_string()),
-        other => return Err(format!("unknown schema type: {other}")),
+) -> Result<(), ApplyError> {
+    let (kind, local) = match schema_type {
+        SCHEMA_NODE => (
+            "label",
+            g.get_labels().get(id as usize).map(|l| l.to_string()),
+        ),
+        SCHEMA_EDGE => (
+            "relationship type",
+            g.get_types().get(id as usize).map(|t| t.to_string()),
+        ),
+        other => {
+            return Err(ApplyError::UnknownDiscriminant {
+                kind: "schema type",
+                value: other,
+            });
+        }
     };
-    match local {
-        Some(local) if local == name => Ok(()),
-        Some(local) => Err(format!(
-            "effects buffer references '{name}' (id {id}), which is '{local}' on this replica"
-        )),
-        None => Err(format!(
-            "effects buffer references '{name}' (id {id}), which does not exist on this replica"
-        )),
-    }
+    resolved(kind, name, i64::from(id), local)
 }
 
 /// Mirrors C's `VerifyAttribute`.
@@ -340,27 +432,49 @@ fn verify_attribute(
     g: &Graph,
     id: u16,
     name: &str,
-) -> Result<(), String> {
-    match g.get_node_attribute_names().get(id as usize) {
-        Some(local) if local.as_str() == name => Ok(()),
-        Some(local) => Err(format!(
-            "effects buffer references attribute '{name}' (id {id}), which is '{local}' here"
-        )),
-        None => Err(format!(
-            "effects buffer references attribute '{name}' (id {id}), which does not exist here"
-        )),
+) -> Result<(), ApplyError> {
+    let local = g
+        .get_node_attribute_names()
+        .get(id as usize)
+        .map(|a| a.as_str().to_string());
+    resolved("attribute", name, i64::from(id), local)
+}
+
+fn resolved(
+    kind: &'static str,
+    name: &str,
+    id: i64,
+    local: Option<String>,
+) -> Result<(), ApplyError> {
+    match local {
+        Some(local) if local == name => Ok(()),
+        Some(local) => Err(ApplyError::NameMismatch {
+            kind,
+            name: name.to_string(),
+            id,
+            local,
+        }),
+        None => Err(ApplyError::Unresolved {
+            kind,
+            name: name.to_string(),
+            id,
+        }),
     }
 }
 
 fn resolve_type(
     g: &Graph,
     relation_id: i32,
-) -> Result<Arc<String>, String> {
+) -> Result<Arc<String>, ApplyError> {
+    let out_of_range = || ApplyError::IdOutOfRange {
+        kind: "relationship type",
+        id: i64::from(relation_id),
+    };
     if relation_id < 0 {
-        return Err(format!("negative relationship type id {relation_id}"));
+        return Err(out_of_range());
     }
     g.get_type(TypeId(relation_id as usize))
-        .ok_or_else(|| format!("unknown relationship type id {relation_id}"))
+        .ok_or_else(out_of_range)
 }
 
 /// Expand `(ids, labels)` into the row/column pairs the bulk label API takes,
@@ -369,13 +483,16 @@ fn label_pairs(
     g: &Graph,
     ids: &[u64],
     labels: &[i32],
-) -> Result<(Vec<u64>, Vec<u64>), String> {
+) -> Result<(Vec<u64>, Vec<u64>), ApplyError> {
     let bound = g.get_labels().len();
     let mut rows = Vec::with_capacity(ids.len() * labels.len());
     let mut cols = Vec::with_capacity(ids.len() * labels.len());
     for &label in labels {
         if label < 0 || label as usize >= bound {
-            return Err(format!("label id {label} out of range"));
+            return Err(ApplyError::IdOutOfRange {
+                kind: "label",
+                id: i64::from(label),
+            });
         }
         for &id in ids {
             rows.push(id);
@@ -395,20 +512,23 @@ fn attr_map(
     ids: &[u64],
     attr_ids: &[u16],
     rows: &[Value],
-) -> Result<FxHashMap<u64, Vec<(u16, Value)>>, String> {
+) -> Result<FxHashMap<u64, Vec<(u16, Value)>>, ApplyError> {
     let bound = g.get_node_attribute_names().len();
     for &attr_id in attr_ids {
         if attr_id as usize >= bound {
-            return Err(format!("attribute id {attr_id} out of range"));
+            return Err(ApplyError::IdOutOfRange {
+                kind: "attribute",
+                id: i64::from(attr_id),
+            });
         }
     }
     let width = attr_ids.len();
     if rows.len() != ids.len() * width {
-        return Err(format!(
-            "record declares {} entities x {width} attributes but carries {} values",
-            ids.len(),
-            rows.len()
-        ));
+        return Err(ApplyError::ShapeMismatch {
+            entities: ids.len(),
+            width,
+            values: rows.len(),
+        });
     }
 
     let mut map = FxHashMap::default();
@@ -438,19 +558,22 @@ fn attr_map(
 fn index_options(
     index_type: &IndexType,
     options: Option<&Value>,
-) -> Result<Option<IndexOptions>, String> {
+) -> Result<Option<IndexOptions>, ApplyError> {
     match options {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::Map(m)) => map_to_index_options(index_type, m),
-        Some(other) => Err(format!("index options must be a map, got {other:?}")),
+        Some(Value::Map(m)) => Ok(map_to_index_options(index_type, m)?),
+        Some(other) => Err(ApplyError::OptionsNotAMap(format!("{other:?}"))),
     }
 }
 
-fn entity_type_of(schema_type: u32) -> Result<EntityType, String> {
+fn entity_type_of(schema_type: u32) -> Result<EntityType, ApplyError> {
     match schema_type {
         SCHEMA_NODE => Ok(EntityType::Node),
         SCHEMA_EDGE => Ok(EntityType::Relationship),
-        other => Err(format!("unknown schema type: {other}")),
+        other => Err(ApplyError::UnknownDiscriminant {
+            kind: "schema type",
+            value: other,
+        }),
     }
 }
 
@@ -467,11 +590,14 @@ fn index_type_of(field_type: u32) -> IndexType {
     }
 }
 
-fn constraint_type_of(ct: u32) -> Result<ConstraintType, String> {
+fn constraint_type_of(ct: u32) -> Result<ConstraintType, ApplyError> {
     match ct {
         v3::CT_UNIQUE => Ok(ConstraintType::Unique),
         v3::CT_MANDATORY => Ok(ConstraintType::Mandatory),
-        other => Err(format!("unknown constraint type: {other}")),
+        other => Err(ApplyError::UnknownDiscriminant {
+            kind: "constraint type",
+            value: other,
+        }),
     }
 }
 
@@ -526,8 +652,18 @@ mod tests {
         write_add_schema(&mut buf, SCHEMA_NODE, 0, "Person");
 
         let err = apply_effects_v3(&mut g, &buf).expect_err("must refuse");
-        assert!(err.contains("would assign 1"), "{err}");
-        assert!(err.contains("diverged"), "{err}");
+        assert!(
+            matches!(
+                &err,
+                ApplyError::IdMismatch {
+                    kind: "label",
+                    expected: 0,
+                    assigned: 1,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -541,7 +677,16 @@ mod tests {
         write_add_attribute(&mut buf, 0, "name");
 
         let err = apply_effects_v3(&mut g, &buf).expect_err("must refuse");
-        assert!(err.contains("attribute 'name'"), "{err}");
+        assert!(
+            matches!(
+                &err,
+                ApplyError::IdMismatch {
+                    kind: "attribute",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -565,8 +710,11 @@ mod tests {
             &Value::Null,
         );
         let err = apply_effects_v3(&mut g, &buf).expect_err("must refuse");
-        assert!(err.contains("'Expected'"), "{err}");
-        assert!(err.contains("'Actual'"), "{err}");
+        let ApplyError::NameMismatch { name, local, .. } = &err else {
+            panic!("expected a name mismatch, got {err:?}");
+        };
+        assert_eq!(name, "Expected");
+        assert_eq!(local, "Actual");
     }
 
     #[test]

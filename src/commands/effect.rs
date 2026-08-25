@@ -74,6 +74,7 @@ pub fn graph_effect(
         match buf[0] {
             graph::runtime::effects_v3::EFFECTS_VERSION => {
                 graph::runtime::effects_v3_apply::apply_effects_v3(&mut g, buf)
+                    .map_err(|e| e.to_string())
             }
             _ => apply_effects(&mut g, buf),
         }
