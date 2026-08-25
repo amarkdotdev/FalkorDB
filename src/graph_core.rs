@@ -50,7 +50,7 @@ use graph::{
     },
     planner::{IR, plan_is_non_deterministic},
     runtime::{
-        pending::{
+        effects_v2::{
             EFFECT_CREATE_INDEX, EFFECT_DROP_INDEX, EFFECTS_VERSION, write_string, write_u16,
         },
         runtime::Runtime,

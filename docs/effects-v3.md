@@ -402,7 +402,9 @@ case stays at or under v2's 340,001 bytes.
 ## Building a v3 payload
 
 `graph/src/runtime/effects_v3_emit.rs`, the mirror of `effects_v3_apply.rs`.
-Neither lives in `pending.rs`: a mutation accumulator should not know what a
+The v2 emitter sits beside it in `effects_v2.rs`, whole and separate, so
+retiring the old format is deleting a file rather than untangling one. Neither
+lives in `pending.rs`: a mutation accumulator should not know what a
 replication frame looks like, and the wire format should not reach into
 query-execution state to find out what changed. `Pending` exposes one
 `effects_view()` returning a borrowed `PendingEffects` — a narrow, explicit

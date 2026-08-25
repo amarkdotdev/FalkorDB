@@ -48,6 +48,7 @@
 
 pub mod batch;
 pub mod bitset;
+pub mod effects_v2;
 pub mod effects_v3;
 pub mod effects_v3_apply;
 pub mod effects_v3_emit;

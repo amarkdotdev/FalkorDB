@@ -115,7 +115,11 @@ impl<'a> Iterator for CommitOp<'a> {
                                 buf,
                             )
                         } else {
-                            pending.build_effects_buffer(&self.runtime.g, buf)
+                            crate::runtime::effects_v2::build_effects_buffer(
+                                &pending.effects_view(),
+                                &self.runtime.g,
+                                buf,
+                            )
                         };
                         self.runtime
                             .effects_count

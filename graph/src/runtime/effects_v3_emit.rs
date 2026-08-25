@@ -5,45 +5,13 @@
 //! like, and the wire format should not have to reach into query-execution
 //! state to find out what changed.
 
+use crate::{
+    graph::graph::Graph,
+    runtime::{effects_v3 as v3, pending::PendingEffects, value::Value},
+};
 use atomic_refcell::AtomicRefCell;
 use roaring::RoaringTreemap;
 use rustc_hash::FxHashMap;
-use std::sync::Arc;
-
-use crate::{
-    graph::graph::{DeletedEdge, Graph},
-    runtime::{effects_v3 as v3, value::Value},
-};
-
-/// Everything the emitter reads out of a `Pending`, borrowed.
-///
-/// A narrow view rather than `pub(crate)` fields: this is the exact surface
-/// replication depends on, so widening it is a visible change rather than an
-/// accident. Building one costs nothing but references.
-pub struct PendingEffects<'a> {
-    pub created_nodes: &'a RoaringTreemap,
-    pub created_rels_by_type: &'a FxHashMap<
-        Arc<String>,
-        Vec<(
-            crate::graph::graph::RelationshipId,
-            crate::graph::graph::NodeId,
-            crate::graph::graph::NodeId,
-        )>,
-    >,
-    pub new_nodes_attrs: &'a FxHashMap<u64, Vec<(u16, Value)>>,
-    pub existing_nodes_attrs: &'a FxHashMap<u64, Vec<(u16, Value)>>,
-    pub new_relationships_attrs: &'a FxHashMap<u64, Vec<(u16, Value)>>,
-    pub existing_relationships_attrs: &'a FxHashMap<u64, Vec<(u16, Value)>>,
-    pub set_labels: &'a FxHashMap<u64, Vec<u64>>,
-    pub remove_labels: &'a FxHashMap<u64, Vec<u64>>,
-    pub deleted_nodes: &'a RoaringTreemap,
-    pub deleted_endpoints: &'a [DeletedEdge],
-    /// Sizes of the graph's dictionaries when the query started, so the
-    /// emitter can announce only what this query added.
-    pub schema_label_count: usize,
-    pub schema_rel_type_count: usize,
-    pub schema_node_attr_count: usize,
-}
 
 /// Build a **v3** effects payload from what a query staged.
 ///
@@ -606,7 +574,7 @@ mod tests {
         p.stage_created_node(1, &[], &[]);
 
         let mut v2 = Vec::new();
-        p.build_effects_buffer(&g, &mut v2);
+        crate::runtime::effects_v2::build_effects_buffer(&p.effects_view(), &g, &mut v2);
         let mut v3 = Vec::new();
         build_effects_buffer_v3(&p.effects_view(), &g, &mut v3);
 
@@ -626,7 +594,7 @@ mod tests {
         }
 
         let mut v2 = Vec::new();
-        p.build_effects_buffer(&g, &mut v2);
+        crate::runtime::effects_v2::build_effects_buffer(&p.effects_view(), &g, &mut v2);
         let mut v3 = Vec::new();
         build_effects_buffer_v3(&p.effects_view(), &g, &mut v3);
         println!("\n  10,000 nodes: v2 {} B -> v3 {} B", v2.len(), v3.len());
