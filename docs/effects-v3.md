@@ -261,8 +261,25 @@ For the v2 byte layouts themselves see
       v2   t · string name                       (no id)
       v3   t · AttributeID id · string name
 
-    11–14 CREATE/DROP_INDEX · CREATE/DROP_CONSTRAINT
-      unchanged — singular, and already carry (id, name) pairs
+    11 CREATE_INDEX   — one record per field, unchanged from v2
+      t · SchemaType · LabelID id · string label · AttributeID id · string attr
+        · IndexFieldType · SIValue options
+    12 DROP_INDEX      — mirrors 11 without the options
+    13 CREATE_CONSTRAINT
+      t · ConstraintType · GraphEntityType · LabelID id · string label
+        · uint8 n · (AttributeID id, string name) * n
+    14 DROP_CONSTRAINT — mirrors 13
+
+Three width traps in these, all read from C source rather than inferred:
+`IndexFieldType` is a **bit flag set**, so a range index is
+`NUMERIC|GEO|STR = 0x0E` and not a discriminant of its own; `GraphEntityType` is
+**1-based**, because `GETYPE_UNKNOWN` takes 0, so a node is 1; and the
+constraint property count is a **`uint8`**, not the `u16` used everywhere else.
+
+`CREATE_INDEX` is deliberately not batched. Index DDL is rare, and C applies it
+idempotently per field — `Index_SetLanguage` tolerates a re-set,
+`Index_SetStopwords` is guarded — which is what lets a replica take the fields
+of one index in any order.
 
 ### Entity ids become explicit
 
@@ -457,7 +474,7 @@ the format can be reviewed and tested byte-for-byte on its own.
 | records 1–10, encode + decode, `read_buffer` | done |
 | ids on `ADD_SCHEMA` / `ADD_ATTRIBUTE` | done |
 | grouping `Pending` into v3 records (`build_effects_buffer_v3`) | done, **not yet wired to replication** |
-| records 11–14 (index, constraint) | not yet — this is the deferred #2419 work |
+| records 11–14 (index, constraint) | done |
 | applying v3 on the replica | not yet |
 | the C side | not yet — nothing can ship until this exists |
 

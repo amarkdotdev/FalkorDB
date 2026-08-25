@@ -86,6 +86,37 @@ pub const EFFECT_DROP_CONSTRAINT: u32 = 14;
 pub const SCHEMA_NODE: u32 = 0;
 pub const SCHEMA_EDGE: u32 = 1;
 
+// ── index field types ──
+//
+// `IndexFieldType` is a **bit flag set**, not an ordinal — several can be OR'd
+// together (`index_field.h`). `INDEX_FLD_RANGE` is the union of the three
+// scalar kinds, which is why a range index reads as `0x0E` rather than a
+// discriminant of its own.
+
+pub const INDEX_FLD_UNKNOWN: u32 = 0x00;
+pub const INDEX_FLD_FULLTEXT: u32 = 0x01;
+pub const INDEX_FLD_NUMERIC: u32 = 0x02;
+pub const INDEX_FLD_GEO: u32 = 0x04;
+pub const INDEX_FLD_STR: u32 = 0x08;
+pub const INDEX_FLD_VECTOR: u32 = 0x10;
+/// `INDEX_FLD_NUMERIC | INDEX_FLD_GEO | INDEX_FLD_STR` = `0x0E`.
+pub const INDEX_FLD_RANGE: u32 = INDEX_FLD_NUMERIC | INDEX_FLD_GEO | INDEX_FLD_STR;
+
+// ── constraint types ──
+
+pub const CT_UNIQUE: u32 = 0;
+pub const CT_MANDATORY: u32 = 1;
+
+// ── graph entity types ──
+//
+// **1-based**: `GETYPE_UNKNOWN = 0` comes first, so a node is 1 and an edge 2.
+// A 0-based encoding here would silently make every node record read as
+// "unknown" on the C side.
+
+pub const GETYPE_UNKNOWN: u32 = 0;
+pub const GETYPE_NODE: u32 = 1;
+pub const GETYPE_EDGE: u32 = 2;
+
 // ── block encodings ──
 
 /// Raw ids at the narrowest width that holds the largest of them:
@@ -1174,6 +1205,101 @@ pub fn write_add_attribute(
     write_string(buf, name);
 }
 
+/// One indexed field: which attribute, and how it is indexed.
+///
+/// Grouped rather than passed as three loose arguments because `label_id` and
+/// `attr_id` are both small integers next to each other on the wire —
+/// transposing them is precisely the kind of mistake that does not fail on the
+/// far side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexField<'a> {
+    pub attr_id: u16,
+    pub attr: &'a str,
+    pub field_type: u32,
+}
+
+/// `11 CREATE_INDEX` — **one record per field**, matching C.
+///
+/// Unchanged from v2 and deliberately not batched: index DDL is rare, and C
+/// applies it idempotently per field (`Index_SetLanguage` tolerates a re-set,
+/// `Index_SetStopwords` is guarded). Splitting a multi-field index into one
+/// record per field is what lets a replica apply the fields in any order.
+///
+/// Both the label and the attribute travel as `(id, name)`. The id is
+/// authoritative and the name is the cross-check that turns a numbering
+/// disagreement into a loud failure rather than a write to the wrong attribute.
+pub fn write_create_index(
+    buf: &mut Vec<u8>,
+    schema_type: u32,
+    label_id: i32,
+    label: &str,
+    field: IndexField<'_>,
+    options: &Value,
+) {
+    write_u32(buf, EFFECT_CREATE_INDEX);
+    write_u32(buf, schema_type);
+    write_label_id(buf, label_id);
+    write_string(buf, label);
+    write_u16(buf, field.attr_id);
+    write_string(buf, field.attr);
+    write_u32(buf, field.field_type);
+    write_value(buf, options);
+}
+
+/// `12 DROP_INDEX` — mirrors [`write_create_index`] without the options.
+pub fn write_drop_index(
+    buf: &mut Vec<u8>,
+    schema_type: u32,
+    label_id: i32,
+    label: &str,
+    field: IndexField<'_>,
+) {
+    write_u32(buf, EFFECT_DROP_INDEX);
+    write_u32(buf, schema_type);
+    write_label_id(buf, label_id);
+    write_string(buf, label);
+    write_u16(buf, field.attr_id);
+    write_string(buf, field.attr);
+    write_u32(buf, field.field_type);
+}
+
+/// `13 CREATE_CONSTRAINT` / `14 DROP_CONSTRAINT`.
+///
+/// The property count is a **`u8`**, not the `u16` used elsewhere — C's
+/// `uint8_t n`. Each property travels as `(id, name)` for the same reason the
+/// index records do.
+pub fn write_constraint(
+    buf: &mut Vec<u8>,
+    create: bool,
+    constraint_type: u32,
+    entity_type: u32,
+    label_id: i32,
+    label: &str,
+    props: &[(u16, &str)],
+) {
+    debug_assert!(
+        props.len() <= u8::MAX as usize,
+        "C reads the count as uint8"
+    );
+    write_u32(
+        buf,
+        if create {
+            EFFECT_CREATE_CONSTRAINT
+        } else {
+            EFFECT_DROP_CONSTRAINT
+        },
+    );
+    write_u32(buf, constraint_type);
+    write_u32(buf, entity_type);
+    write_label_id(buf, label_id);
+    write_string(buf, label);
+    write_u8(buf, props.len() as u8);
+    for (attr_id, name) in props {
+        write_u16(buf, *attr_id);
+        write_string(buf, name);
+    }
+}
+
 /// Which entity kind an update targets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GraphEntity {
@@ -1240,6 +1366,25 @@ pub enum Record {
         id: u16,
         name: String,
     },
+    Index {
+        create: bool,
+        schema_type: u32,
+        label_id: i32,
+        label: String,
+        attr_id: u16,
+        attr: String,
+        field_type: u32,
+        /// `None` on a drop, which carries no options.
+        options: Option<Value>,
+    },
+    Constraint {
+        create: bool,
+        constraint_type: u32,
+        entity_type: u32,
+        label_id: i32,
+        label: String,
+        props: Vec<(u16, String)>,
+    },
 }
 
 /// Read one record, whatever its opcode.
@@ -1261,6 +1406,49 @@ pub fn read_record(r: &mut Reader<'_>) -> Result<Record, DecodeError> {
             return Ok(Record::AddAttribute {
                 id,
                 name: r.string()?,
+            });
+        }
+        EFFECT_CREATE_INDEX | EFFECT_DROP_INDEX => {
+            let create = opcode == EFFECT_CREATE_INDEX;
+            let schema_type = r.u32()?;
+            let label_id = r.i32()?;
+            let label = r.string()?;
+            let attr_id = r.u16()?;
+            let attr = r.string()?;
+            let field_type = r.u32()?;
+            let options = if create { Some(read_value(r)?) } else { None };
+            return Ok(Record::Index {
+                create,
+                schema_type,
+                label_id,
+                label,
+                attr_id,
+                attr,
+                field_type,
+                options,
+            });
+        }
+        EFFECT_CREATE_CONSTRAINT | EFFECT_DROP_CONSTRAINT => {
+            let create = opcode == EFFECT_CREATE_CONSTRAINT;
+            let constraint_type = r.u32()?;
+            let entity_type = r.u32()?;
+            let label_id = r.i32()?;
+            let label = r.string()?;
+            let n = r.u8()?;
+            // Each pair is at least 2 bytes of id plus an 8-byte length.
+            let n = r.guard_count(u64::from(n), 10)?;
+            let mut props = Vec::with_capacity(n);
+            for _ in 0..n {
+                let attr_id = r.u16()?;
+                props.push((attr_id, r.string()?));
+            }
+            return Ok(Record::Constraint {
+                create,
+                constraint_type,
+                entity_type,
+                label_id,
+                label,
+                props,
             });
         }
         _ => {}
@@ -1935,9 +2123,42 @@ mod tests {
         write_labels(&mut buf, false, &[1], &[8]);
         write_delete_edge(&mut buf, &[5, 6], 1, &[1, 1], &[2, 2]);
         write_delete_node(&mut buf, &[1, 2]);
+        write_create_index(
+            &mut buf,
+            SCHEMA_NODE,
+            7,
+            "L",
+            IndexField {
+                attr_id: 0,
+                attr: "since",
+                field_type: INDEX_FLD_RANGE,
+            },
+            &Value::Null,
+        );
+        write_drop_index(
+            &mut buf,
+            SCHEMA_NODE,
+            7,
+            "L",
+            IndexField {
+                attr_id: 0,
+                attr: "since",
+                field_type: INDEX_FLD_RANGE,
+            },
+        );
+        write_constraint(
+            &mut buf,
+            true,
+            CT_UNIQUE,
+            GETYPE_NODE,
+            7,
+            "L",
+            &[(0, "since")],
+        );
+        write_constraint(&mut buf, false, CT_MANDATORY, GETYPE_EDGE, 1, "KNOWS", &[]);
 
         let records = read_buffer(&buf).unwrap();
-        assert_eq!(records.len(), 10, "one command, ten records");
+        assert_eq!(records.len(), 14, "one command, fourteen records");
 
         // Re-encoding what was decoded must reproduce the buffer exactly.
         let mut again = new_buffer();
@@ -1989,6 +2210,63 @@ mod tests {
                     write_delete_edge(&mut again, ids, *relation_id, src, dst);
                 }
                 Record::DeleteNode { ids } => write_delete_node(&mut again, ids),
+                Record::Index {
+                    create,
+                    schema_type,
+                    label_id,
+                    label,
+                    attr_id,
+                    attr,
+                    field_type,
+                    options,
+                } => {
+                    if *create {
+                        write_create_index(
+                            &mut again,
+                            *schema_type,
+                            *label_id,
+                            label,
+                            IndexField {
+                                attr_id: *attr_id,
+                                attr,
+                                field_type: *field_type,
+                            },
+                            options.as_ref().expect("a create carries options"),
+                        );
+                    } else {
+                        write_drop_index(
+                            &mut again,
+                            *schema_type,
+                            *label_id,
+                            label,
+                            IndexField {
+                                attr_id: *attr_id,
+                                attr,
+                                field_type: *field_type,
+                            },
+                        );
+                    }
+                }
+                Record::Constraint {
+                    create,
+                    constraint_type,
+                    entity_type,
+                    label_id,
+                    label,
+                    props,
+                } => {
+                    let props: Vec<(u16, &str)> =
+                        props.iter().map(|(id, n)| (*id, n.as_str())).collect();
+                    write_constraint(
+                        &mut again,
+                        *create,
+                        *constraint_type,
+                        *entity_type,
+                        *label_id,
+                        label,
+                        &props,
+                    );
+                }
             }
         }
         assert_eq!(hex(&again), hex(&buf), "encode(decode(x)) must equal x");
@@ -2081,6 +2359,188 @@ mod tests {
         write_create_edge(&mut edges, &eids, 1, &src, &dst, &[], &[]);
         println!("  10,000 supernode edges:        {} B", edges.len());
         assert_eq!(read_buffer(&edges).unwrap().len(), 1);
+    }
+
+    // ── index and constraint records ──
+
+    #[test]
+    fn index_field_types_are_c_bit_flags() {
+        // A range index is the union of the three scalar kinds, not a
+        // discriminant of its own — 0x0E, which reads as garbage if treated as
+        // an ordinal.
+        assert_eq!(INDEX_FLD_RANGE, 0x0E);
+        assert_eq!(INDEX_FLD_FULLTEXT, 0x01);
+        assert_eq!(INDEX_FLD_VECTOR, 0x10);
+        // And entity types are 1-based, because GETYPE_UNKNOWN takes 0.
+        assert_eq!(GETYPE_NODE, 1);
+        assert_eq!(GETYPE_EDGE, 2);
+    }
+
+    #[test]
+    fn create_index_keeps_the_name_beside_each_id() {
+        let mut buf = new_buffer();
+        write_create_index(
+            &mut buf,
+            SCHEMA_NODE,
+            3,
+            "Person",
+            IndexField {
+                attr_id: 9,
+                attr: "name",
+                field_type: INDEX_FLD_RANGE,
+            },
+            &Value::Null,
+        );
+        let records = read_buffer(&buf).unwrap();
+        assert_eq!(
+            records[0],
+            Record::Index {
+                create: true,
+                schema_type: SCHEMA_NODE,
+                label_id: 3,
+                label: "Person".into(),
+                attr_id: 9,
+                attr: "name".into(),
+                field_type: INDEX_FLD_RANGE,
+                options: Some(Value::Null),
+            }
+        );
+    }
+
+    #[test]
+    fn a_multi_field_index_is_one_record_per_field() {
+        // Not batched, matching C: index DDL is rare, and C applies it
+        // idempotently per field so a replica can take them in any order.
+        let mut buf = new_buffer();
+        for (attr_id, attr) in [(0_u16, "a"), (1, "b"), (2, "c")] {
+            write_create_index(
+                &mut buf,
+                SCHEMA_NODE,
+                1,
+                "L",
+                IndexField {
+                    attr_id,
+                    attr,
+                    field_type: INDEX_FLD_RANGE,
+                },
+                &Value::Null,
+            );
+        }
+        assert_eq!(read_buffer(&buf).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn drop_index_carries_no_options() {
+        let mut buf = new_buffer();
+        write_drop_index(
+            &mut buf,
+            SCHEMA_EDGE,
+            1,
+            "KNOWS",
+            IndexField {
+                attr_id: 0,
+                attr: "since",
+                field_type: INDEX_FLD_RANGE,
+            },
+        );
+        let records = read_buffer(&buf).unwrap();
+        let Record::Index {
+            create, options, ..
+        } = &records[0]
+        else {
+            panic!("wrong record");
+        };
+        assert!(!create);
+        assert_eq!(*options, None);
+    }
+
+    #[test]
+    fn constraint_property_count_is_one_byte() {
+        // C reads it as uint8_t, not the u16 used elsewhere in the format.
+        let mut buf = Vec::new();
+        write_constraint(
+            &mut buf,
+            true,
+            CT_UNIQUE,
+            GETYPE_NODE,
+            3,
+            "Person",
+            &[(0, "first"), (1, "last")],
+        );
+        // opcode, ct, et, label_id, then the string, then a single count byte.
+        let after_label = 4 + 4 + 4 + 4 + (8 + "Person".len() + 1);
+        assert_eq!(buf[after_label], 2, "the count is one byte wide");
+    }
+
+    #[test]
+    fn constraints_round_trip_with_their_property_names() {
+        let mut buf = new_buffer();
+        write_constraint(
+            &mut buf,
+            true,
+            CT_UNIQUE,
+            GETYPE_NODE,
+            3,
+            "Person",
+            &[(0, "first"), (1, "last")],
+        );
+        write_constraint(
+            &mut buf,
+            false,
+            CT_MANDATORY,
+            GETYPE_EDGE,
+            1,
+            "KNOWS",
+            &[(2, "since")],
+        );
+
+        let records = read_buffer(&buf).unwrap();
+        assert_eq!(
+            records[0],
+            Record::Constraint {
+                create: true,
+                constraint_type: CT_UNIQUE,
+                entity_type: GETYPE_NODE,
+                label_id: 3,
+                label: "Person".into(),
+                props: vec![(0, "first".into()), (1, "last".into())],
+            }
+        );
+        let Record::Constraint {
+            create,
+            entity_type,
+            props,
+            ..
+        } = &records[1]
+        else {
+            panic!("wrong record");
+        };
+        assert!(!create);
+        assert_eq!(*entity_type, GETYPE_EDGE);
+        assert_eq!(props, &vec![(2_u16, "since".to_string())]);
+    }
+
+    #[test]
+    fn ddl_records_carry_no_count() {
+        // Like the schema records, these are singular.
+        let mut buf = Vec::new();
+        write_drop_index(
+            &mut buf,
+            SCHEMA_NODE,
+            1,
+            "L",
+            IndexField {
+                attr_id: 0,
+                attr: "a",
+                field_type: INDEX_FLD_RANGE,
+            },
+        );
+        assert_eq!(&buf[..4], &EFFECT_DROP_INDEX.to_le_bytes());
+        assert_eq!(
+            &buf[4..8],
+            &SCHEMA_NODE.to_le_bytes(),
+            "schema type, not a count"
+        );
     }
 
     #[test]
