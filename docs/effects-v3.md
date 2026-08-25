@@ -437,6 +437,42 @@ So `delete_relationships` and `delete_implicit_edges` now return
 `DeletedEdge = (RelationshipId, type_id, NodeId, NodeId)`. Both already resolved
 the type internally and were discarding it.
 
+## Applying a v3 payload
+
+`graph/src/runtime/effects_v3_apply.rs`. It lives in the `graph` crate rather
+than beside the v2 handler because it touches only graph types — no
+`redis_module` — which also lets it be tested against a real `Graph`.
+
+**The v2 path's batching machinery disappears.** v2 has to reconstruct batches it
+never received: it accumulates runs of adjacent `DELETE_NODE` records and flushes
+on a type change, because applying a node's edges one at a time made a replica
+~40x slower than the master that produced the writes. In v3 a record already
+covers every entity of its shape, so each one applies as a single bulk call. The
+look-ahead, the two pending batches and the flush logic all go.
+
+**The id checks are the point.** On `ADD_SCHEMA` and `ADD_ATTRIBUTE` the replica
+computes the id it *would* assign and rejects the whole buffer if it disagrees
+with the wire. C's reader has a weaker check — it refuses a name that already
+exists locally — which catches a replica that is *ahead* but not one whose
+dictionary is a different length, where appending the same new name yields a
+different id. Index and constraint records additionally resolve label and
+attribute by id and confirm the name matches, mirroring C's `VerifySchema` and
+`VerifyAttribute`.
+
+Two behaviours worth stating because they are choices, not consequences:
+
+- **A constraint installs the master's outcome; the replica does not
+  re-validate.** A replica scanning independently would do so at a different
+  time against different write interleavings and could legitimately reach a
+  different status.
+- **Index creation uses the sync variant.** A replica must not spawn population
+  threads, and must not reorder its work against the effect stream.
+
+`OPTIONS {...}` now survives the trip. v2 dropped the map on the wire and forced
+those statements to replicate as verbatim `GRAPH.QUERY`; v3 carries it, and the
+replica rebuilds the same `IndexOptions` through the same
+`map_to_index_options` the master used rather than approximating it.
+
 ## Migration and rollout
 
 Both engines must speak v3 before either emits it. C accepts `≤ its own version`,
@@ -475,7 +511,7 @@ the format can be reviewed and tested byte-for-byte on its own.
 | ids on `ADD_SCHEMA` / `ADD_ATTRIBUTE` | done |
 | grouping `Pending` into v3 records (`build_effects_buffer_v3`) | done, **not yet wired to replication** |
 | records 11–14 (index, constraint) | done |
-| applying v3 on the replica | not yet |
+| applying v3 on the replica (`effects_v3_apply.rs`) | done, **not yet reachable** — nothing emits v3 |
 | the C side | not yet — nothing can ship until this exists |
 
 `build_effects_buffer_v3` sits beside `build_effects_buffer`, which still owns
@@ -504,6 +540,11 @@ What the unit tests do cover (`cargo test -p graph --lib effects_v3`, and
   shapes do split, that a created node's labels do not also produce a
   `SET_LABELS` record, that deleted edges group by type, and that two
   `Pending`s populated in opposite orders produce **byte-identical** buffers.
+- On the apply path: a schema or attribute id disagreement aborts the buffer, a
+  stale label id is caught by its name, and a **master-to-replica round trip** —
+  build a real `Pending`, emit, apply to an empty graph, compare observable
+  state. Encoder and decoder agreeing with each other is not the same as either
+  being right.
 
 The real gate is the cross-engine harness driving the real
 `falkordb/falkordb-server:edge-c` image, in both directions, for each of: live

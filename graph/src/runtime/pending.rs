@@ -1631,6 +1631,24 @@ impl Pending {
         n_effects
     }
 
+    /// Stage a created node directly. Test-only: the real path goes through
+    /// the runtime, which needs a whole query to drive it.
+    #[cfg(test)]
+    pub fn stage_created_node_for_test(
+        &mut self,
+        id: u64,
+        labels: &[u64],
+        attrs: &[(u16, Value)],
+    ) {
+        self.created_nodes.insert(id);
+        if !labels.is_empty() {
+            self.set_labels.insert(id, labels.to_vec());
+        }
+        if !attrs.is_empty() {
+            self.new_nodes_attrs.insert(id, attrs.to_vec());
+        }
+    }
+
     /// Build a **v3** effects payload: one record per `(opcode, partition key)`
     /// instead of one per entity.
     ///

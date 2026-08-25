@@ -1795,7 +1795,13 @@ impl<'a> Runtime<'a> {
     }
 }
 
-fn map_to_index_options(
+/// Convert a Cypher `OPTIONS {...}` map into typed index options.
+///
+/// Public because the v3 effects apply path needs it too: v3 carries the
+/// options map on the wire (v2 dropped it), and the replica has to turn it back
+/// into the same `IndexOptions` the master built, not a re-derived
+/// approximation.
+pub fn map_to_index_options(
     index_type: &IndexType,
     kv_map: &OrderMap<Arc<String>, Value>,
 ) -> Result<Option<IndexOptions>, String> {

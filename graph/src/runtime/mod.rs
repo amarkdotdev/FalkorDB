@@ -49,6 +49,7 @@
 pub mod batch;
 pub mod bitset;
 pub mod effects_v3;
+pub mod effects_v3_apply;
 pub mod eval;
 pub mod functions;
 pub mod ops;
