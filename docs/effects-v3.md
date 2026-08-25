@@ -509,14 +509,40 @@ the format can be reviewed and tested byte-for-byte on its own.
 | the five blocks, encode + decode | done |
 | records 1–10, encode + decode, `read_buffer` | done |
 | ids on `ADD_SCHEMA` / `ADD_ATTRIBUTE` | done |
-| grouping `Pending` into v3 records (`build_effects_buffer_v3`) | done, **not yet wired to replication** |
+| grouping `Pending` into v3 records (`build_effects_buffer_v3`) | done, wired behind `EFFECTS_VERSION` |
 | records 11–14 (index, constraint) | done |
-| applying v3 on the replica (`effects_v3_apply.rs`) | done, **not yet reachable** — nothing emits v3 |
+| applying v3 on the replica (`effects_v3_apply.rs`) | done, always active — reads are version-dispatched |
 | the C side | not yet — nothing can ship until this exists |
 
-`build_effects_buffer_v3` sits beside `build_effects_buffer`, which still owns
-replication. Both exist until C can read v3, because a master emitting v3 to a
-v2 replica is a silent data-loss bug rather than a degraded mode.
+### The switch
+
+`GRAPH.CONFIG SET EFFECTS_VERSION 2|3` picks what a node **emits**, and defaults
+to **2**. Reads are always dispatched on the version byte that arrived, so a
+node reads both regardless of what it writes.
+
+That asymmetry is the whole rollout mechanism, and it is the same one C uses
+(`if (*v > EFFECTS_VERSION)`, `effects_apply.c:689`): **upgrade readers, then
+flip writers**. A master emitting v3 at a peer that cannot read it is silent data
+loss rather than a degraded mode, which is why the default cannot move until the
+C engine reads v3.
+
+The value is range-checked to 2 or 3 at the config layer. Anything else would
+stamp a version byte no peer can read, and the failure would land on the replica
+rather than on the operator who typed it.
+
+### Verified against live servers
+
+Two module instances, one replicating from the other, 2026-08-26:
+
+- `EFFECTS_VERSION` defaults to 2; `SET` to 1 or 99 is refused with
+  `expected 2 or 3` and leaves the previous value in place.
+- With the master at 3, every write reached the replica as `GRAPH.EFFECT` with a
+  `\x03` version byte followed by opcode 9 (`ADD_SCHEMA`).
+- Flipping the master back to 2 mid-stream produced `\x02` on the wire, and the
+  same replica applied it without a restart.
+- Master and replica agreed exactly afterwards: 988 nodes, 987 `:Person`, 65
+  `:Young`, 1 `:Later`, and matching property values — across creates, a label
+  set, a delete, and the v2 write that followed.
 
 ## Verification
 

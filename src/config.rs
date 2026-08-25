@@ -76,6 +76,12 @@ pub static RESULTSET_SIZE: AtomicI64 = AtomicI64::new(-1);
 pub static QUERY_MEM_CAPACITY: AtomicI64 = AtomicI64::new(0);
 pub static DELTA_MAX_PENDING_CHANGES: AtomicI64 = AtomicI64::new(10000);
 pub static EFFECTS_THRESHOLD: AtomicI64 = AtomicI64::new(300);
+/// Which effects wire format this node **emits**.
+///
+/// Re-exported from the `graph` crate rather than duplicated: the emit decision
+/// is made there, and two statics would drift the moment one path set only one
+/// of them. `GRAPH.CONFIG SET` and the load-time argument both land here.
+pub use graph::runtime::pending::EFFECTS_EMIT_VERSION as EFFECTS_VERSION;
 /// Toggles the telemetry stream that backs `GRAPH.INFO`. Atomic rather than
 /// GIL-guarded because the query hot path reads it off the main thread, and
 /// because C lets `GRAPH.CONFIG SET CMD_INFO yes|no` flip it at runtime.
@@ -127,6 +133,7 @@ pub const CONFIG_NAMES: &[&str] = &[
     "CMD_INFO",
     "MAX_INFO_QUERIES",
     "EFFECTS_THRESHOLD",
+    "EFFECTS_VERSION",
     "BOLT_PORT",
     "DELAY_INDEXING",
     "IMPORT_FOLDER",

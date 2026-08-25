@@ -68,7 +68,15 @@ pub fn graph_effect(
 
     let result = {
         let mut g = g_arc.borrow_mut();
-        apply_effects(&mut g, buf)
+        // Dispatch on what arrived, not on what this node emits. A reader must
+        // accept every version it understands — that is what lets replicas be
+        // upgraded before masters.
+        match buf[0] {
+            graph::runtime::effects_v3::EFFECTS_VERSION => {
+                graph::runtime::effects_v3_apply::apply_effects_v3(&mut g, buf)
+            }
+            _ => apply_effects(&mut g, buf),
+        }
     };
 
     match result {

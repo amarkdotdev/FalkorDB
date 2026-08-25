@@ -31,7 +31,26 @@ use rustc_hash::FxHashMap;
 use atomic_refcell::AtomicRefCell;
 use roaring::RoaringTreemap;
 
+use std::sync::atomic::{AtomicI64, Ordering};
+
 use crate::graph::graph::DeletedEdge;
+
+/// Which effects wire format this node **emits**.
+///
+/// Reading is version-dispatched, so a node always reads both. This only picks
+/// what it writes, and it defaults to 2: a master emitting v3 at a peer that
+/// cannot read it is silent data loss, not a degraded mode. The ordering is the
+/// ordinary one — upgrade readers, then flip writers.
+///
+/// Lives here rather than in the module's config because the emit decision is
+/// made here; `GRAPH.CONFIG SET EFFECTS_VERSION` forwards to it.
+pub static EFFECTS_EMIT_VERSION: AtomicI64 = AtomicI64::new(2);
+
+/// The buffer builder matching [`EFFECTS_EMIT_VERSION`].
+#[must_use]
+pub fn emit_v3() -> bool {
+    EFFECTS_EMIT_VERSION.load(Ordering::Relaxed) >= 3
+}
 use crate::{
     entity_type::EntityType,
     graph::{
@@ -2520,6 +2539,32 @@ mod v3_tests {
         assert_eq!(ids, &vec![1, 3]);
         assert_eq!(src, &vec![10, 14]);
         assert_eq!(dst, &vec![11, 15]);
+    }
+
+    #[test]
+    fn the_emit_switch_selects_the_format_and_defaults_to_v2() {
+        // Default must be 2. A master emitting v3 at a peer that cannot read it
+        // is silent data loss, so this is a safety property, not a preference.
+        assert_eq!(
+            EFFECTS_EMIT_VERSION.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "v3 must not be the default until every peer can read it"
+        );
+        assert!(!emit_v3());
+
+        let g = graph();
+        let mut p = Pending::default();
+        p.set_schema_baseline(&g);
+        p.created_nodes.insert(1);
+
+        let mut v2 = Vec::new();
+        p.build_effects_buffer(&g, &mut v2);
+        let mut v3 = Vec::new();
+        p.build_effects_buffer_v3(&g, &mut v3);
+
+        // The version byte is what a reader dispatches on, so it has to differ.
+        assert_eq!(v2[0], 2);
+        assert_eq!(v3[0], 3);
     }
 
     #[test]
