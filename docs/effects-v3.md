@@ -382,6 +382,44 @@ lands at parity with v2. A single record is 33 bytes for a one-byte id, 34 for a
 two-byte id (exactly v2) and 36 past 2^16. A regression test asserts the worst
 case stays at or under v2's 340,001 bytes.
 
+## Building a v3 payload
+
+The grouping is cheap because `Pending` already holds most of it: `created_nodes`
+is a `RoaringTreemap`, so ids arrive ascending for free; `created_rels_by_type`
+is already partitioned by relationship type; and the attribute vectors are
+already "sorted by id, unique", which is exactly the shape key.
+
+Three rules the emitter has to enforce that the format alone does not:
+
+**Label order must be normalized.** `set_labels` keeps caller order, so `[7,8]`
+and `[8,7]` arrive for the same set. They are one shape, and `LabelSet` is
+emitted ascending — which is also what makes two engines that agree on the set
+produce the same bytes.
+
+**Group iteration must be ordered.** A `HashMap` iterates arbitrarily, so the
+same query could emit its records in a different order on two runs. That alone
+would defeat the byte-for-byte comparison the cross-engine harness rests on, so
+groups are sorted by key before emission.
+
+**A new attribute is announced once, not once per entity kind.** #2459 unified
+the two attribute dictionaries, so `get_node_attribute_names` and
+`get_relationship_attribute_names` return the same store. v2 could iterate both
+harmlessly because its `ADD_ATTRIBUTE` carries a node/relationship
+discriminator and the replica's registration is get-or-create. v3's does not
+carry one — correctly, since C has a single dictionary — so iterating both would
+announce every new attribute twice under the same id.
+
+### `DELETE_EDGE` needs the type captured at deletion time
+
+v3 groups deleted edges by relationship type, and the type cannot be recovered
+when the buffer is built: the edge is already gone. `index_remove_edge_docs` is
+not a substitute — it is only populated for types that carry an index
+(`graph.rs`, guarded by `has_index`).
+
+So `delete_relationships` and `delete_implicit_edges` now return
+`DeletedEdge = (RelationshipId, type_id, NodeId, NodeId)`. Both already resolved
+the type internally and were discarding it.
+
 ## Migration and rollout
 
 Both engines must speak v3 before either emits it. C accepts `≤ its own version`,
@@ -418,10 +456,14 @@ the format can be reviewed and tested byte-for-byte on its own.
 | the five blocks, encode + decode | done |
 | records 1–10, encode + decode, `read_buffer` | done |
 | ids on `ADD_SCHEMA` / `ADD_ATTRIBUTE` | done |
+| grouping `Pending` into v3 records (`build_effects_buffer_v3`) | done, **not yet wired to replication** |
 | records 11–14 (index, constraint) | not yet — this is the deferred #2419 work |
-| emitting v3 from `build_effects_buffer` | not yet |
 | applying v3 on the replica | not yet |
 | the C side | not yet — nothing can ship until this exists |
+
+`build_effects_buffer_v3` sits beside `build_effects_buffer`, which still owns
+replication. Both exist until C can read v3, because a master emitting v3 to a
+v2 replica is a silent data-loss bug rather than a degraded mode.
 
 ## Verification
 
@@ -430,7 +472,8 @@ does not fail on the far side, it makes C read misaligned bytes as a type and wr
 through the resulting pointer (the `AttributeSet_Update` segfault seen when feeding
 C our v2-ish buffers).
 
-What the unit tests do cover (`cargo test -p graph --lib effects_v3`):
+What the unit tests do cover (`cargo test -p graph --lib effects_v3`, and
+`--lib v3_tests` for the emit path):
 
 - **Byte-pinned records**, so a width change fails here rather than on the far side.
 - **`encode(decode(x)) == x`** across all ten record types. Stronger than checking
@@ -440,6 +483,10 @@ What the unit tests do cover (`cargo test -p graph --lib effects_v3`):
   count read off the wire is checked against the bytes remaining before it
   reaches `Vec::with_capacity`, so a corrupt length cannot OOM us.
 - The **cardinality assertion** on `IdSet`, and an out-of-range `IdList` rank.
+- On the emit path: that label order does not split a shape, that differing
+  shapes do split, that a created node's labels do not also produce a
+  `SET_LABELS` record, that deleted edges group by type, and that two
+  `Pending`s populated in opposite orders produce **byte-identical** buffers.
 
 The real gate is the cross-engine harness driving the real
 `falkordb/falkordb-server:edge-c` image, in both directions, for each of: live

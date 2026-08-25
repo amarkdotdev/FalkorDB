@@ -31,6 +31,7 @@ use rustc_hash::FxHashMap;
 use atomic_refcell::AtomicRefCell;
 use roaring::RoaringTreemap;
 
+use crate::graph::graph::DeletedEdge;
 use crate::{
     entity_type::EntityType,
     graph::{
@@ -121,7 +122,7 @@ pub struct Pending {
     /// Relationships to be deleted
     deleted_relationships: RoaringTreemap,
     /// Endpoints for deleted relationships — populated by commit(), used by build_effects_buffer().
-    deleted_endpoints: Vec<(RelationshipId, NodeId, NodeId)>,
+    deleted_endpoints: Vec<DeletedEdge>,
     /// Property updates for newly created nodes (fast path: skip fjall).
     /// Values are attribute-id-resolved, sorted by id, unique.
     new_nodes_attrs: FxHashMap<u64, Vec<(u16, Value)>>,
@@ -975,9 +976,9 @@ impl Pending {
             let count = implicit_edges.len();
             stats.borrow_mut().relationships_deleted += count;
             // Record in deleted_relationships so effects buffer can serialize them
-            for (rel_id, from, to) in implicit_edges {
+            for (rel_id, type_id, from, to) in implicit_edges {
                 self.deleted_relationships.insert(u64::from(rel_id));
-                self.deleted_endpoints.push((rel_id, from, to));
+                self.deleted_endpoints.push((rel_id, type_id, from, to));
             }
         }
         if !explicit_rels.is_empty() {
@@ -988,7 +989,7 @@ impl Pending {
             // stale/missing ids) for stats and effects/constraint bookkeeping.
             stats.borrow_mut().relationships_deleted += endpoints.len();
             self.deleted_relationships
-                .extend(endpoints.iter().map(|(id, _, _)| u64::from(*id)));
+                .extend(endpoints.iter().map(|(id, _, _, _)| u64::from(*id)));
             self.deleted_endpoints.extend(endpoints);
         }
         // Enforce constraints before accumulating index operations.
@@ -1612,7 +1613,7 @@ impl Pending {
         }
 
         // --- Deleted relationships (before nodes, so replica removes edges first) ---
-        for &(rel_id, from, to) in &self.deleted_endpoints {
+        for &(rel_id, _type_id, from, to) in &self.deleted_endpoints {
             buf.push(EFFECT_DELETE_EDGE);
             buf.extend_from_slice(&u64::from(rel_id).to_le_bytes());
             buf.extend_from_slice(&u64::from(from).to_le_bytes());
@@ -1629,6 +1630,299 @@ impl Pending {
 
         n_effects
     }
+
+    /// Build a **v3** effects payload: one record per `(opcode, partition key)`
+    /// instead of one per entity.
+    ///
+    /// Not yet wired to replication — [`Self::build_effects_buffer`] still owns
+    /// that. Both exist side by side until the C engine can read v3, because a
+    /// master that emits v3 to a v2 replica is a silent data-loss bug, not a
+    /// degraded mode.
+    ///
+    /// The grouping is cheap because `Pending` already stores most of it:
+    /// `created_nodes` is a `RoaringTreemap`, so ids arrive ascending for free;
+    /// `created_rels_by_type` is already partitioned by relationship type; and
+    /// the attribute vectors are already "sorted by id, unique", which is
+    /// exactly the shape key.
+    pub fn build_effects_buffer_v3(
+        &self,
+        g: &AtomicRefCell<Graph>,
+        buf: &mut Vec<u8>,
+    ) -> u64 {
+        use crate::runtime::effects_v3 as v3;
+
+        let mut n_effects = 0u64;
+        if buf.is_empty() {
+            buf.push(v3::EFFECTS_VERSION);
+        }
+
+        // --- Schema and attribute additions, each carrying its id ---
+        //
+        // These must precede every record that references the ids they
+        // introduce. That ordering is normative in v3, not incidental: the ids
+        // on the wire are only meaningful once the replica has agreed on the
+        // numbering that produced them.
+        {
+            let graph = g.borrow();
+            for (offset, label) in graph
+                .get_labels()
+                .iter()
+                .enumerate()
+                .skip(self.schema_label_count)
+            {
+                v3::write_add_schema(buf, v3::SCHEMA_NODE, offset as i32, label);
+                n_effects += 1;
+            }
+            for (offset, rel_type) in graph
+                .get_types()
+                .iter()
+                .enumerate()
+                .skip(self.schema_rel_type_count)
+            {
+                v3::write_add_schema(buf, v3::SCHEMA_EDGE, offset as i32, rel_type);
+                n_effects += 1;
+            }
+            // Once, not once per entity kind. #2459 unified the two attribute
+            // dictionaries, so `get_node_attribute_names` and
+            // `get_relationship_attribute_names` return the same store — and
+            // unlike v2's, v3's ADD_ATTRIBUTE has no node/relationship
+            // discriminator, so emitting both loops would send every new
+            // attribute twice under the same id.
+            for (offset, attr) in graph
+                .get_node_attribute_names()
+                .iter()
+                .enumerate()
+                .skip(self.schema_node_attr_count)
+            {
+                v3::write_add_attribute(buf, offset as u16, attr);
+                n_effects += 1;
+            }
+        }
+
+        // --- Created nodes, grouped by (labels, attribute ids) ---
+        n_effects += self.emit_created_nodes_v3(buf);
+
+        // --- Created relationships, grouped by (type, attribute ids) ---
+        n_effects += self.emit_created_edges_v3(g, buf);
+
+        // --- Property updates on entities that already existed ---
+        n_effects += emit_updates_v3(buf, &self.existing_nodes_attrs, v3::GraphEntity::Node);
+        n_effects += emit_updates_v3(
+            buf,
+            &self.existing_relationships_attrs,
+            v3::GraphEntity::Edge,
+        );
+
+        // --- Label changes on nodes this query did not create ---
+        // A created node carries its labels in its CREATE_NODE record already.
+        n_effects += emit_labels_v3(buf, &self.set_labels, Some(&self.created_nodes), true);
+        n_effects += emit_labels_v3(buf, &self.remove_labels, None, false);
+
+        // --- Deletions: edges before nodes, so the replica unhooks first ---
+        n_effects += self.emit_deleted_edges_v3(buf);
+        if !self.deleted_nodes.is_empty() {
+            let ids: Vec<u64> = self.deleted_nodes.iter().collect();
+            v3::write_delete_node(buf, &ids);
+            n_effects += 1;
+        }
+
+        n_effects
+    }
+
+    fn emit_created_nodes_v3(
+        &self,
+        buf: &mut Vec<u8>,
+    ) -> u64 {
+        use crate::runtime::effects_v3 as v3;
+
+        // Shape key: the node's labels and its attribute ids. Labels are sorted
+        // because `set_labels` keeps caller order — [7,8] and [8,7] are the same
+        // shape, and emitting them ascending is what makes two engines that
+        // agree on the set produce the same bytes.
+        let mut groups: FxHashMap<(Vec<i32>, Vec<u16>), Vec<u64>> = FxHashMap::default();
+        for id in &self.created_nodes {
+            let mut labels: Vec<i32> = self
+                .set_labels
+                .get(&id)
+                .map(|l| l.iter().map(|&v| v as i32).collect())
+                .unwrap_or_default();
+            labels.sort_unstable();
+            labels.dedup();
+            let attr_ids: Vec<u16> = self
+                .new_nodes_attrs
+                .get(&id)
+                .map(|a| a.iter().map(|(aid, _)| *aid).collect())
+                .unwrap_or_default();
+            groups.entry((labels, attr_ids)).or_default().push(id);
+        }
+
+        let mut n = 0;
+        for ((labels, attr_ids), ids) in sorted_groups(groups) {
+            let rows = gather_rows(&ids, &attr_ids, &self.new_nodes_attrs);
+            v3::write_create_node(buf, &ids, &labels, &attr_ids, &rows);
+            n += 1;
+        }
+        n
+    }
+
+    fn emit_created_edges_v3(
+        &self,
+        g: &AtomicRefCell<Graph>,
+        buf: &mut Vec<u8>,
+    ) -> u64 {
+        use crate::runtime::effects_v3 as v3;
+
+        if self.created_rels_by_type.is_empty() {
+            return 0;
+        }
+        let graph = g.borrow();
+        let mut n = 0;
+        for (type_name, entries) in &self.created_rels_by_type {
+            let relation_id = graph
+                .get_type_id(type_name)
+                .expect("created relationship type must be registered")
+                .0 as i32;
+            // Already partitioned by type; split further by attribute shape.
+            let mut groups: FxHashMap<Vec<u16>, Vec<(u64, u64, u64)>> = FxHashMap::default();
+            for &(rel_id, from, to) in entries {
+                let id = u64::from(rel_id);
+                let attr_ids: Vec<u16> = self
+                    .new_relationships_attrs
+                    .get(&id)
+                    .map(|a| a.iter().map(|(aid, _)| *aid).collect())
+                    .unwrap_or_default();
+                groups
+                    .entry(attr_ids)
+                    .or_default()
+                    .push((id, u64::from(from), u64::from(to)));
+            }
+            for (attr_ids, mut rows) in sorted_groups(groups) {
+                // IdSet requires ascending ids, and the endpoints must stay
+                // aligned with them, so sort the triples together.
+                rows.sort_unstable();
+                let ids: Vec<u64> = rows.iter().map(|r| r.0).collect();
+                let src: Vec<u64> = rows.iter().map(|r| r.1).collect();
+                let dst: Vec<u64> = rows.iter().map(|r| r.2).collect();
+                let values = gather_rows(&ids, &attr_ids, &self.new_relationships_attrs);
+                v3::write_create_edge(buf, &ids, relation_id, &src, &dst, &attr_ids, &values);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    fn emit_deleted_edges_v3(
+        &self,
+        buf: &mut Vec<u8>,
+    ) -> u64 {
+        use crate::runtime::effects_v3 as v3;
+
+        let mut groups: FxHashMap<u64, Vec<(u64, u64, u64)>> = FxHashMap::default();
+        for &(rel_id, type_id, from, to) in &self.deleted_endpoints {
+            groups.entry(type_id).or_default().push((
+                u64::from(rel_id),
+                u64::from(from),
+                u64::from(to),
+            ));
+        }
+        let mut n = 0;
+        for (type_id, mut rows) in sorted_groups(groups) {
+            rows.sort_unstable();
+            let ids: Vec<u64> = rows.iter().map(|r| r.0).collect();
+            let src: Vec<u64> = rows.iter().map(|r| r.1).collect();
+            let dst: Vec<u64> = rows.iter().map(|r| r.2).collect();
+            v3::write_delete_edge(buf, &ids, type_id as i32, &src, &dst);
+            n += 1;
+        }
+        n
+    }
+}
+
+/// Groups in a deterministic order.
+///
+/// A `HashMap` iterates arbitrarily, so without this the same query could emit
+/// its records in a different order on two runs — which would defeat the
+/// byte-for-byte comparison the cross-engine harness rests on.
+fn sorted_groups<K: Ord, V>(groups: FxHashMap<K, V>) -> Vec<(K, V)> {
+    let mut out: Vec<(K, V)> = groups.into_iter().collect();
+    out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// The `count x n` row-major values for one shape.
+///
+/// An entity missing one of the shape's attributes gets `T_NULL` in that slot —
+/// unambiguous, because FalkorDB never stores a null property value.
+fn gather_rows(
+    ids: &[u64],
+    attr_ids: &[u16],
+    attrs: &FxHashMap<u64, Vec<(u16, Value)>>,
+) -> Vec<Value> {
+    let mut rows = Vec::with_capacity(ids.len() * attr_ids.len());
+    for id in ids {
+        let entity = attrs.get(id);
+        for attr_id in attr_ids {
+            let value = entity
+                .and_then(|a| a.iter().find(|(aid, _)| aid == attr_id))
+                .map_or(Value::Null, |(_, v)| v.clone());
+            rows.push(value);
+        }
+    }
+    rows
+}
+
+/// `UPDATE_NODE` / `UPDATE_EDGE`, grouped by attribute shape.
+fn emit_updates_v3(
+    buf: &mut Vec<u8>,
+    attrs: &FxHashMap<u64, Vec<(u16, Value)>>,
+    entity: crate::runtime::effects_v3::GraphEntity,
+) -> u64 {
+    use crate::runtime::effects_v3 as v3;
+
+    let mut groups: FxHashMap<Vec<u16>, Vec<u64>> = FxHashMap::default();
+    for (id, pairs) in attrs {
+        let shape: Vec<u16> = pairs.iter().map(|(aid, _)| *aid).collect();
+        groups.entry(shape).or_default().push(*id);
+    }
+    let mut n = 0;
+    for (attr_ids, mut ids) in sorted_groups(groups) {
+        ids.sort_unstable();
+        let rows = gather_rows(&ids, &attr_ids, attrs);
+        v3::write_update(buf, entity, &ids, &attr_ids, &rows);
+        n += 1;
+    }
+    n
+}
+
+/// `SET_LABELS` / `REMOVE_LABELS`, grouped by label set.
+///
+/// `skip` excludes nodes whose labels already travel inside their
+/// `CREATE_NODE` record.
+fn emit_labels_v3(
+    buf: &mut Vec<u8>,
+    labels: &FxHashMap<u64, Vec<u64>>,
+    skip: Option<&RoaringTreemap>,
+    add: bool,
+) -> u64 {
+    use crate::runtime::effects_v3 as v3;
+
+    let mut groups: FxHashMap<Vec<i32>, Vec<u64>> = FxHashMap::default();
+    for (&id, label_ids) in labels {
+        if skip.is_some_and(|s| s.contains(id)) {
+            continue;
+        }
+        let mut shape: Vec<i32> = label_ids.iter().map(|&v| v as i32).collect();
+        shape.sort_unstable();
+        shape.dedup();
+        groups.entry(shape).or_default().push(id);
+    }
+    let mut n = 0;
+    for (label_ids, mut ids) in sorted_groups(groups) {
+        ids.sort_unstable();
+        v3::write_labels(buf, add, &ids, &label_ids);
+        n += 1;
+    }
+    n
 }
 
 // ── Effects buffer constants and helpers ──
@@ -1929,5 +2223,306 @@ pub fn read_value(
             Ok(Value::Duration(dur))
         }
         _ => Err(format!("unknown value tag in effects buffer: {tag}")),
+    }
+}
+
+#[cfg(test)]
+mod v3_tests {
+    use super::*;
+    use crate::graph::graphblas::test_init::ensure_init;
+    use crate::runtime::effects_v3::{GraphEntity, Record, read_buffer};
+
+    fn graph() -> AtomicRefCell<Graph> {
+        // GrB_init is process-wide and may only run once.
+        ensure_init();
+        AtomicRefCell::new(Graph::new(64, 64, 0, 0, "t"))
+    }
+
+    /// Register `n` node attributes so the ids the tests use resolve.
+    fn with_attrs(
+        g: &AtomicRefCell<Graph>,
+        names: &[&str],
+    ) {
+        let mut graph = g.borrow_mut();
+        for name in names {
+            graph.add_node_attribute_name(name);
+        }
+    }
+
+    fn build(
+        p: &Pending,
+        g: &AtomicRefCell<Graph>,
+    ) -> Vec<Record> {
+        let mut buf = Vec::new();
+        p.build_effects_buffer_v3(g, &mut buf);
+        read_buffer(&buf).expect("v3 buffer must decode")
+    }
+
+    #[test]
+    fn nodes_of_one_shape_become_one_record() {
+        let g = graph();
+        with_attrs(&g, &["a"]);
+        let mut p = Pending::default();
+        p.set_schema_baseline(&g);
+        for id in 0..100u64 {
+            p.created_nodes.insert(id);
+            p.set_labels.insert(id, vec![0]);
+            p.new_nodes_attrs
+                .insert(id, vec![(0, Value::Int(id as i64))]);
+        }
+
+        let records = build(&p, &g);
+        assert_eq!(records.len(), 1, "100 nodes, one shape, one record");
+        let Record::CreateNode {
+            ids,
+            labels,
+            attr_ids,
+            rows,
+        } = &records[0]
+        else {
+            panic!("wrong record: {:?}", records[0]);
+        };
+        assert_eq!(ids.len(), 100);
+        assert_eq!(labels, &vec![0]);
+        assert_eq!(attr_ids, &vec![0]);
+        assert_eq!(rows.len(), 100);
+        // Row k belongs to the k-th smallest id.
+        assert_eq!(rows[7], Value::Int(7));
+    }
+
+    #[test]
+    fn label_order_does_not_split_a_shape() {
+        // set_labels keeps caller order, so [0,1] and [1,0] arrive differently
+        // for the same set. They must land in one record, sorted.
+        let g = graph();
+        let mut p = Pending::default();
+        p.set_schema_baseline(&g);
+        p.created_nodes.insert(1);
+        p.set_labels.insert(1, vec![0, 1]);
+        p.created_nodes.insert(2);
+        p.set_labels.insert(2, vec![1, 0]);
+
+        let records = build(&p, &g);
+        assert_eq!(records.len(), 1, "same label set, so one record");
+        let Record::CreateNode { ids, labels, .. } = &records[0] else {
+            panic!("wrong record");
+        };
+        assert_eq!(ids, &vec![1, 2]);
+        assert_eq!(
+            labels,
+            &vec![0, 1],
+            "emitted ascending, so bytes are canonical"
+        );
+    }
+
+    #[test]
+    fn differing_shapes_split_into_separate_records() {
+        let g = graph();
+        with_attrs(&g, &["a", "b"]);
+        let mut p = Pending::default();
+        p.set_schema_baseline(&g);
+        p.created_nodes.insert(1);
+        p.new_nodes_attrs.insert(1, vec![(0, Value::Int(1))]);
+        p.created_nodes.insert(2);
+        p.new_nodes_attrs.insert(2, vec![(1, Value::Int(2))]);
+
+        let records = build(&p, &g);
+        assert_eq!(
+            records.len(),
+            2,
+            "different attribute ids are different shapes"
+        );
+    }
+
+    #[test]
+    fn a_created_node_carries_its_labels_and_emits_no_set_labels() {
+        let g = graph();
+        let mut p = Pending::default();
+        p.set_schema_baseline(&g);
+        p.created_nodes.insert(1);
+        p.set_labels.insert(1, vec![3]);
+        // A node that already existed does need a SET_LABELS record.
+        p.set_labels.insert(99, vec![3]);
+
+        let records = build(&p, &g);
+        assert_eq!(records.len(), 2);
+        assert!(matches!(records[0], Record::CreateNode { .. }));
+        let Record::Labels { add, ids, labels } = &records[1] else {
+            panic!("expected SET_LABELS for the pre-existing node");
+        };
+        assert!(add);
+        assert_eq!(ids, &vec![99], "the created node is not repeated here");
+        assert_eq!(labels, &vec![3]);
+    }
+
+    #[test]
+    fn updates_group_by_attribute_shape() {
+        let g = graph();
+        with_attrs(&g, &["a", "b"]);
+        let mut p = Pending::default();
+        p.set_schema_baseline(&g);
+        p.existing_nodes_attrs.insert(1, vec![(0, Value::Int(1))]);
+        p.existing_nodes_attrs.insert(2, vec![(0, Value::Int(2))]);
+        p.existing_nodes_attrs
+            .insert(3, vec![(0, Value::Int(3)), (1, Value::Int(4))]);
+
+        let records = build(&p, &g);
+        assert_eq!(records.len(), 2, "two shapes");
+        let Record::Update { entity, ids, .. } = &records[0] else {
+            panic!("wrong record");
+        };
+        assert_eq!(*entity, GraphEntity::Node);
+        assert_eq!(ids, &vec![1, 2]);
+    }
+
+    #[test]
+    fn schema_records_precede_the_records_that_use_them() {
+        // Normative ordering: an id on the wire means nothing until the replica
+        // has agreed on the numbering that produced it.
+        let g = graph();
+        {
+            let mut graph = g.borrow_mut();
+            graph.get_label_id_mut("L");
+            graph.add_node_attribute_name("a");
+        }
+        // Default counts are already zero, which is what "the schema is new"
+        // means: everything the graph holds gets announced.
+        let mut p = Pending::default();
+        p.created_nodes.insert(1);
+        p.set_labels.insert(1, vec![0]);
+        p.new_nodes_attrs.insert(1, vec![(0, Value::Int(1))]);
+
+        let records = build(&p, &g);
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            records[0],
+            Record::AddSchema {
+                schema_type: 0,
+                id: 0,
+                name: "L".into()
+            }
+        );
+        assert_eq!(
+            records[1],
+            Record::AddAttribute {
+                id: 0,
+                name: "a".into()
+            }
+        );
+        assert!(matches!(records[2], Record::CreateNode { .. }));
+    }
+
+    #[test]
+    fn grouping_is_deterministic() {
+        // Two Pendings built in different insertion orders must produce
+        // byte-identical buffers, or the cross-engine comparison is worthless.
+        let g = graph();
+        with_attrs(&g, &["a", "b"]);
+        let mut forward = Pending::default();
+        let mut backward = Pending::default();
+        forward.set_schema_baseline(&g);
+        backward.set_schema_baseline(&g);
+        for id in 0..50u64 {
+            forward.created_nodes.insert(id);
+            forward
+                .new_nodes_attrs
+                .insert(id, vec![((id % 2) as u16, Value::Int(id as i64))]);
+        }
+        for id in (0..50u64).rev() {
+            backward.created_nodes.insert(id);
+            backward
+                .new_nodes_attrs
+                .insert(id, vec![((id % 2) as u16, Value::Int(id as i64))]);
+        }
+
+        let mut a = Vec::new();
+        forward.build_effects_buffer_v3(&g, &mut a);
+        let mut b = Vec::new();
+        backward.build_effects_buffer_v3(&g, &mut b);
+        assert_eq!(a, b, "insertion order must not reach the wire");
+    }
+
+    #[test]
+    fn a_new_attribute_is_announced_once() {
+        // #2459 unified the node and relationship attribute dictionaries, so
+        // the two getters return the same store. v3's ADD_ATTRIBUTE carries no
+        // discriminator, so announcing per entity kind would send the same
+        // attribute twice under the same id.
+        let g = graph();
+        {
+            let mut graph = g.borrow_mut();
+            graph.add_node_attribute_name("a");
+            graph.add_node_attribute_name("b");
+        }
+        // Default counts are zero, so both attributes are new.
+        let p = Pending::default();
+
+        let records = build(&p, &g);
+        assert_eq!(
+            records,
+            vec![
+                Record::AddAttribute {
+                    id: 0,
+                    name: "a".into()
+                },
+                Record::AddAttribute {
+                    id: 1,
+                    name: "b".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn deleted_edges_group_by_relationship_type() {
+        // The type has to be captured at deletion time — the edge is gone by
+        // the time effects are built, and index_remove_edge_docs only knows
+        // about types that carry an index.
+        let g = graph();
+        let mut p = Pending::default();
+        p.set_schema_baseline(&g);
+        p.deleted_endpoints = vec![
+            (1.into(), 0, 10.into(), 11.into()),
+            (2.into(), 1, 12.into(), 13.into()),
+            (3.into(), 0, 14.into(), 15.into()),
+        ];
+
+        let records = build(&p, &g);
+        assert_eq!(records.len(), 2, "two types, two records");
+        let Record::DeleteEdge {
+            ids,
+            relation_id,
+            src,
+            dst,
+        } = &records[0]
+        else {
+            panic!("wrong record: {:?}", records[0]);
+        };
+        assert_eq!(*relation_id, 0);
+        assert_eq!(ids, &vec![1, 3]);
+        assert_eq!(src, &vec![10, 14]);
+        assert_eq!(dst, &vec![11, 15]);
+    }
+
+    #[test]
+    fn v3_is_smaller_than_v2_for_the_motivating_query() {
+        let g = graph();
+        with_attrs(&g, &["v"]);
+        let mut p = Pending::default();
+        p.set_schema_baseline(&g);
+        for id in 0..10_000u64 {
+            p.created_nodes.insert(id);
+            p.set_labels.insert(id, vec![0]);
+            p.new_nodes_attrs
+                .insert(id, vec![(0, Value::Int(id as i64))]);
+        }
+
+        let mut v2 = Vec::new();
+        p.build_effects_buffer(&g, &mut v2);
+        let mut v3 = Vec::new();
+        p.build_effects_buffer_v3(&g, &mut v3);
+        println!("\n  10,000 nodes: v2 {} B -> v3 {} B", v2.len(), v3.len());
+        assert!(v3.len() * 2 < v2.len(), "v2 {} v3 {}", v2.len(), v3.len());
+        assert_eq!(read_buffer(&v3).unwrap().len(), 1);
     }
 }

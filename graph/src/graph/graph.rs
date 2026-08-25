@@ -255,6 +255,15 @@ pub struct MemoryUsageReport {
 /// reachable in practice, since the tensor compound key caps node ids at u32.
 const EDGE_NO_ENDPOINT: u64 = u64::MAX;
 
+/// A relationship removed by [`Graph::delete_relationships`] or
+/// [`Graph::delete_implicit_edges`]: its id, **its type**, and its endpoints.
+///
+/// The type is captured here because it cannot be recovered afterwards — the
+/// edge is gone by the time effects are built — and v3's `DELETE_EDGE` groups by
+/// it. `index_remove_edge_docs` is not a substitute: it is only populated for
+/// types that actually carry an index.
+pub type DeletedEdge = (RelationshipId, u64, NodeId, NodeId);
+
 pub struct Graph {
     /// Graph name (Redis key name)
     name: String,
@@ -2269,7 +2278,7 @@ impl Graph {
         &mut self,
         rels: &RoaringTreemap,
         index_remove_edge_docs: &mut FxHashMap<u64, FxHashMap<u64, (u64, u64)>>,
-    ) -> Result<Vec<(RelationshipId, NodeId, NodeId)>, String> {
+    ) -> Result<Vec<DeletedEdge>, String> {
         if rels.is_empty() {
             return Ok(Vec::new());
         }
@@ -2305,8 +2314,7 @@ impl Graph {
         self.relationship_count -= resolved.len();
         self.relationship_attrs.remove_all(&resolved);
 
-        let mut endpoints: Vec<(RelationshipId, NodeId, NodeId)> =
-            Vec::with_capacity(resolved.len() as usize);
+        let mut endpoints: Vec<DeletedEdge> = Vec::with_capacity(resolved.len() as usize);
         // (edge_id, type_id) pairs for a single bulk removal from the type matrix.
         let mut tm_rows: Vec<u64> = Vec::with_capacity(endpoints.capacity());
         let mut tm_cols: Vec<u64> = Vec::with_capacity(endpoints.capacity());
@@ -2333,7 +2341,7 @@ impl Graph {
             for &(edge_id, src, dst) in type_rels {
                 tm_rows.push(edge_id);
                 tm_cols.push(type_id);
-                endpoints.push((RelationshipId(edge_id), NodeId(src), NodeId(dst)));
+                endpoints.push((RelationshipId(edge_id), type_id, NodeId(src), NodeId(dst)));
                 self.clear_edge_endpoint(edge_id);
             }
 
@@ -2388,12 +2396,12 @@ impl Graph {
         deleted_nodes: &RoaringTreemap,
         explicit_rels: &RoaringTreemap,
         index_remove_edge_docs: &mut FxHashMap<u64, FxHashMap<u64, (u64, u64)>>,
-    ) -> Result<Vec<(RelationshipId, NodeId, NodeId)>, String> {
+    ) -> Result<Vec<DeletedEdge>, String> {
         if self.relationship_matrices.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut all_implicit: Vec<(RelationshipId, NodeId, NodeId)> = Vec::new();
+        let mut all_implicit: Vec<DeletedEdge> = Vec::new();
         // Pairs where only one endpoint is deleted — need adjacency check
         let mut check_adj_pairs: std::collections::HashSet<(u64, u64)> =
             std::collections::HashSet::default();
@@ -2443,7 +2451,7 @@ impl Graph {
             let type_name = &self.relationship_types[type_idx];
             let is_indexed = self.edge_indexer.has_index(type_name);
             for &(edge_id, src, dst) in &rels {
-                all_implicit.push((RelationshipId(edge_id), NodeId(src), NodeId(dst)));
+                all_implicit.push((RelationshipId(edge_id), type_id, NodeId(src), NodeId(dst)));
 
                 // Stage an edge-index document removal so cascade
                 // deletes don't leave stale index hits on the next
