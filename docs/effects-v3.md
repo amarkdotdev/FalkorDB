@@ -401,6 +401,22 @@ case stays at or under v2's 340,001 bytes.
 
 ## Building a v3 payload
 
+`graph/src/runtime/effects_v3_emit.rs`, the mirror of `effects_v3_apply.rs`.
+Neither lives in `pending.rs`: a mutation accumulator should not know what a
+replication frame looks like, and the wire format should not reach into
+query-execution state to find out what changed. `Pending` exposes one
+`effects_view()` returning a borrowed `PendingEffects` — a narrow, explicit
+statement of what replication depends on, rather than `pub(crate)` fields that
+widen by accident.
+
+**The shapes are deliberately not pre-grouped inside `Pending`.** Attributes
+accumulate incrementally — `set_node_attribute` inserts into a sorted vec — so
+`CREATE (n) SET n.a=1 SET n.b=2` changes that node's shape twice, and
+pre-bucketing would mean re-bucketing on every attribute write. It would also
+charge every write for a grouping most of them never use, since effects are only
+built when something is actually replicating. The grouping stays a view computed
+at commit.
+
 The grouping is cheap because `Pending` already holds most of it: `created_nodes`
 is a `RoaringTreemap`, so ids arrive ascending for free; `created_rels_by_type`
 is already partitioned by relationship type; and the attribute vectors are
@@ -509,7 +525,7 @@ the format can be reviewed and tested byte-for-byte on its own.
 | the five blocks, encode + decode | done |
 | records 1–10, encode + decode, `read_buffer` | done |
 | ids on `ADD_SCHEMA` / `ADD_ATTRIBUTE` | done |
-| grouping `Pending` into v3 records (`build_effects_buffer_v3`) | done, wired behind `EFFECTS_VERSION` |
+| grouping `Pending` into v3 records (`effects_v3_emit.rs`) | done, wired behind `EFFECTS_VERSION` |
 | records 11–14 (index, constraint) | done |
 | applying v3 on the replica (`effects_v3_apply.rs`) | done, always active — reads are version-dispatched |
 | the C side | not yet — nothing can ship until this exists |

@@ -767,19 +767,19 @@ mod tests {
 
         let mut p = Pending::default();
         for id in 0..500u64 {
-            p.stage_created_node_for_test(
-                id,
-                &[0],
-                &[(0, Value::Int(id as i64)), (1, Value::Int(30))],
-            );
+            p.stage_created_node(id, &[0], &[(0, Value::Int(id as i64)), (1, Value::Int(30))]);
         }
         // A second shape, so the buffer carries more than one record.
         for id in 500..600u64 {
-            p.stage_created_node_for_test(id, &[0], &[(0, Value::Int(id as i64))]);
+            p.stage_created_node(id, &[0], &[(0, Value::Int(id as i64))]);
         }
 
         let mut buf = Vec::new();
-        p.build_effects_buffer_v3(&master, &mut buf);
+        crate::runtime::effects_v3_emit::build_effects_buffer_v3(
+            &p.effects_view(),
+            &master,
+            &mut buf,
+        );
         assert_eq!(
             read_buffer(&buf).unwrap().len(),
             5,
