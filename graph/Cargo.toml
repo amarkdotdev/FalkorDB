@@ -54,3 +54,7 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 [[bench]]
 name = "effects_v3"
 harness = false
+
+[[bench]]
+name = "effects_v2_vs_v3"
+harness = false

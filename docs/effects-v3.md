@@ -549,6 +549,88 @@ those statements to replicate as verbatim `GRAPH.QUERY`; v3 carries it, and the
 replica rebuilds the same `IndexOptions` through the same
 `map_to_index_options` the master used rather than approximating it.
 
+## v2 against v3, measured
+
+`cargo bench -p graph --bench effects_v2_vs_v3`, on
+`UNWIND range(0,N-1) AS i CREATE (:Person {name:'n'+i, age:i%80})` — a string
+property and an int, which is a more representative payload than the
+single-int case quoted elsewhere in this document.
+
+### Payload
+
+| nodes | v2 | v3 | v3/v2 | v3 + zstd-1 | vs v2 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 40 B | 52 B | **130%** | 52 B | 130% |
+| 100 | 3,991 B | 2,844 B | 71.3% | 336 B | 8.4% |
+| 1,000 | 40,891 B | 28,944 B | 70.8% | 1,781 B | 4.4% |
+| 10,000 | 418,891 B | 298,944 B | 71.4% | 11,124 B | 2.7% |
+| 100,000 | 4,288,891 B | 3,088,954 B | 72.0% | 39,094 B | 0.9% |
+| 1,000,000 | 43,888,891 B | 31,889,159 B | 72.7% | 258,662 B | **0.6%** |
+
+Two things this says that the single-int figures do not. **A single-node write is
+30% larger under v3** — the 4-byte opcode, the 4-byte count and the 4-byte label
+ids cost more than narrowing the id saves when there is only one row to amortise
+them over. Forty bytes against fifty-two decides nothing, but the direction is
+worth stating. And **the steady-state saving here is ~28%, not the 65% the
+single-int query shows**, because a string property is the same bytes in both
+formats: v3 removes framing, and the more of the payload is values, the less
+framing there is to remove. Compression is what changes the order of magnitude.
+
+### Encode, on the write thread
+
+| nodes | v2 | v3 | v3 + zstd-1 |
+| --- | --- | --- | --- |
+| 1 | 102 ns | 324 ns | 1.38 µs |
+| 100 | 2.08 µs | 5.98 µs | 12.2 µs |
+| 1,000 | 21.6 µs | 54.6 µs | 77.8 µs |
+| 10,000 | 207 µs | 482 µs | 656 µs |
+| 100,000 | 2.39 ms | 5.55 ms | 6.90 ms |
+| 1,000,000 | 68.6 ms | 146 ms | 162 ms |
+
+**v3 encoding costs 2.1–3.2× what v2 costs**, and that is the honest headline.
+v2 walks its entities and writes; v3 hashes a shape key per entity, builds and
+sorts the groups, and gathers row-major values. The bytes are bought with CPU on
+the GIL-holding write thread, and at a million nodes that is +78 ms.
+
+### Decode
+
+| nodes | v3 | v3 + zstd-1 |
+| --- | --- | --- |
+| 1 | 105 ns | 103 ns |
+| 100 | 3.69 µs | 6.38 µs |
+| 1,000 | 37.8 µs | 49.8 µs |
+| 10,000 | 404 µs | 505 µs |
+| 100,000 | 4.02 ms | 4.83 ms |
+| 1,000,000 | 41.7 ms | 51.1 ms |
+
+v2 has no standalone decoder to compare against — its bytes are read and applied
+to a `Graph` in one pass, in the root crate — so this is v3 only. Decompression
+adds 12–25%.
+
+### Query execution, live
+
+Master and replica, `EFFECTS_THRESHOLD 0`, best of three after a warmup,
+`GRAPH.QUERY` internal execution time:
+
+| nodes | v2 | v3 | |
+| --- | --- | --- | --- |
+| 1 | 0.033 ms | 0.034 ms | 1.03× |
+| 100 | 0.064 ms | 0.079 ms | 1.23× |
+| 1,000 | 0.381 ms | 0.456 ms | 1.20× |
+| 10,000 | 2.973 ms | 3.494 ms | 1.18× |
+| 100,000 | 28.933 ms | 41.011 ms | **1.42×** |
+
+The encode cost shows up in query latency, at roughly a fifth for mid-size
+writes and 42% at 100,000 nodes. The replica agreed with the master on every
+run, under both formats.
+
+**This is the trade to argue about**, and it is not obviously worth taking on a
+fast link: v3 costs measurable write latency to save ~28% of a payload that
+replicates asynchronously. It becomes clearly worth it when compression is on
+(0.6% of v2 at a million nodes) or when the link, rather than the write thread,
+is the constraint. Nothing here is a reason to move the `EFFECTS_VERSION`
+default; the reason for v3 is that two engines can read it.
+
 ## Migration and rollout
 
 Both engines must speak v3 before either emits it. C accepts `≤ its own version`,

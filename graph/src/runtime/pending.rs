@@ -1488,14 +1488,16 @@ impl Pending {
     /// in the same query accumulate into a single effects buffer.
     /// Returns the number of effect records written.
 
-    // ── test-only staging ──
+    // ── staging, for tests and benchmarks ──
     //
     // The real path goes through the runtime, which needs a whole query to
-    // drive it. These let the effects tests stage state directly without the
-    // fields above becoming visible to everything.
+    // drive it. These let the effects tests and the codec benchmarks build a
+    // `Pending` directly. `doc(hidden)` rather than `cfg(test)` because the
+    // benchmarks are a separate compilation unit and would not see a test-only
+    // API — the same reason `write_id_list_forced` is exposed this way.
 
     /// Stage a created node, with its labels and attributes.
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn stage_created_node(
         &mut self,
         id: u64,
@@ -1512,7 +1514,7 @@ impl Pending {
     }
 
     /// Stage a property update on a node that already existed.
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn stage_updated_node(
         &mut self,
         id: u64,
@@ -1522,7 +1524,7 @@ impl Pending {
     }
 
     /// Stage a label change on a node this query did not create.
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn stage_label_change(
         &mut self,
         id: u64,
@@ -1532,7 +1534,7 @@ impl Pending {
     }
 
     /// Stage deleted edges, endpoints and type included.
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn stage_deleted_edges(
         &mut self,
         edges: Vec<DeletedEdge>,
