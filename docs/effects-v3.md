@@ -607,6 +607,42 @@ v2 has no standalone decoder to compare against — its bytes are read and appli
 to a `Graph` in one pass, in the root crate — so this is v3 only. Decompression
 adds 12–25%.
 
+### Where the v3 writer spends its cycles
+
+100,000 nodes of one shape, `cargo bench -p graph --bench effects_versions --
+writer_breakdown`. The id and attribute blocks are measured directly; the row
+gathering is what is left of the whole encode once the other three are removed,
+and is labelled as inferred rather than measured.
+
+| stage | ms | share |
+| --- | --- | --- |
+| grouping — building the shape keys | 2.21 | **39%** |
+| row gathering — *by difference* | 2.51 | **44%** |
+| writing values (`AttrSet`) | 0.70 | 12% |
+| roaring ids (`IdSet`) | 0.31 | 5% |
+| whole encode | 5.72 | 100% |
+
+**Only 18% of the writer writes bytes.** The other 82% is the batching
+machinery — deciding which entities share a shape and collecting their values
+into row-major order. That is the whole of v3's cost over v2, which walks its
+entities and writes them without ever grouping.
+
+Roaring is not the expense, which is worth saying because it is the part that
+looks expensive: 5%.
+
+Two specific things account for most of it, both fixable and neither fixed here:
+
+- **The shape key allocates twice per node.** `digest_created_nodes` builds a
+  `Vec<i32>` of labels and a `Vec<u16>` of attribute ids for *every* node purely
+  to use as a `HashMap` key — 200,000 heap allocations for 100,000 nodes, before
+  any hashing. A key that borrows, or an interned shape id, removes it.
+- **`gather_rows` is quadratic in the shape's width.** For each cell it does
+  `attrs.get(id)` and then a linear `find` over that entity's attribute vector.
+  Both sides are already sorted by attribute id, so a merge walk would make it
+  linear; at two attributes the difference is small, at twenty it is not.
+
+Neither changes the wire format, so both can land after it is settled.
+
 ### Both sides of the link, against verbatim
 
 **Verbatim is the baseline.** With a replica attached the choice is between

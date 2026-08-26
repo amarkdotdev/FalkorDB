@@ -59,6 +59,10 @@ lto = true
 [profile.bench]
 inherits = "release"
 lto = false
+# Symbols only — no codegen change, so timings stay comparable — but samply can
+# name the frames instead of reporting bare addresses.
+debug = true
+strip = false
 
 [profile.profiling]
 inherits = "release"

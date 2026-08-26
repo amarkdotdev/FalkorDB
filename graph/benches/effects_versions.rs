@@ -25,6 +25,8 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use std::hint::black_box;
 
 use atomic_refcell::AtomicRefCell;
+use rustc_hash::FxHashMap;
+
 use graph::{
     effects::{EffectEncode, v2, v3},
     graph::graph::Graph,
@@ -301,5 +303,91 @@ fn encode_shape(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, encode, decode, stream_vs_materialize, encode_shape);
+/// Where the v3 writer's time goes, at 100,000 nodes of one shape.
+///
+/// Measured by isolating the two stages that are reachable through the public
+/// codec — the id block and the attribute block — and taking the rest of the
+/// whole-encode time as the grouping and row-gathering that produced them. The
+/// remainder is arrived at by subtraction and labelled as such.
+fn writer_breakdown(c: &mut Criterion) {
+    const N: usize = 100_000;
+    let (g, p) = fixture(N);
+    let ids: Vec<u64> = (0..N as u64).collect();
+    // The rows a single-shape CREATE of this query produces: a string and an int
+    // per node, row-major.
+    let rows: Vec<Value> = (0..N as u64)
+        .flat_map(|i| {
+            [
+                Value::String(std::sync::Arc::new(format!("n{i}"))),
+                Value::Int((i % 80) as i64),
+            ]
+        })
+        .collect();
+
+    let mut group = c.benchmark_group("writer_breakdown");
+    group.sample_size(20);
+
+    group.bench_function("whole_encode", |b| {
+        b.iter(|| {
+            let mut buf = Vec::new();
+            v3::emit::build_effects_buffer_v3(black_box(&p), &g, &mut buf);
+            black_box(buf.len())
+        });
+    });
+    // The roaring bitmap: build, run-optimize, size, serialize.
+    group.bench_function("id_block", |b| {
+        b.iter(|| {
+            let mut buf = Vec::new();
+            v3::write_id_set(&mut buf, black_box(&ids));
+            black_box(buf.len())
+        });
+    });
+    // Every SIValue written out.
+    group.bench_function("attr_block", |b| {
+        b.iter(|| {
+            let mut buf = Vec::new();
+            v3::write_attr_set(&mut buf, &[0, 1], black_box(&rows));
+            black_box(buf.len())
+        });
+    });
+    // Cloning the values out of Pending into row-major order is part of the
+    // remainder; this is the clone alone, without the encoding.
+    group.bench_function("row_clone_only", |b| {
+        b.iter(|| {
+            let cloned: Vec<Value> = black_box(&rows).clone();
+            black_box(cloned.len())
+        });
+    });
+    // The remainder above is the grouping plus row-gathering. This is the
+    // grouping's shape-key loop on its own, reproduced from
+    // `digest_created_nodes`, to confirm it is where the remainder goes rather
+    // than inferring it: a Vec<i32> and a Vec<u16> are allocated per node
+    // purely to serve as the hash key.
+    group.bench_function("shape_key_loop", |b| {
+        let labels_src: Vec<u64> = vec![0];
+        let attrs_src: Vec<(u16, Value)> = vec![(0, Value::Int(0)), (1, Value::Int(0))];
+        b.iter(|| {
+            let mut groups: FxHashMap<(Vec<i32>, Vec<u16>), Vec<u64>> = FxHashMap::default();
+            for id in 0..N as u64 {
+                let mut labels: Vec<i32> =
+                    black_box(&labels_src).iter().map(|&v| v as i32).collect();
+                labels.sort_unstable();
+                labels.dedup();
+                let attr_ids: Vec<u16> = black_box(&attrs_src).iter().map(|(a, _)| *a).collect();
+                groups.entry((labels, attr_ids)).or_default().push(id);
+            }
+            black_box(groups.len())
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    encode,
+    decode,
+    stream_vs_materialize,
+    encode_shape,
+    writer_breakdown
+);
 criterion_main!(benches);
