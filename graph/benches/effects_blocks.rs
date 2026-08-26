@@ -15,13 +15,13 @@
 //! which is the shape a supernode produces.
 //!
 //! ```bash
-//! cargo bench -p graph --bench effects_v3
+//! cargo bench -p graph --bench effects_blocks
 //! ```
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
-use graph::runtime::effects_v3::{
+use graph::effects::v3::{
     BlockEncoding, Reader, read_id_list, read_id_set, write_id_list, write_id_list_forced,
     write_id_set,
 };

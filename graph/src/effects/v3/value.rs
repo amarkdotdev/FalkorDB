@@ -154,8 +154,8 @@ pub fn read_value(r: &mut Reader<'_>) -> Result<Value, DecodeError> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::hex;
     use super::*;
+    use crate::effects::hex;
 
     // ── SIValue ──
 

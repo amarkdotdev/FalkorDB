@@ -202,7 +202,7 @@ slightly smaller. Both decode identically, and the decoder always supports every
 encoding — so unlike the wire layout, this heuristic does **not** have to match
 between the two engines, and either side can tune it without a version bump.
 
-Measured, 10,000 rows (`cargo bench -p graph --bench effects_v3`):
+Measured, 10,000 rows (`cargo bench -p graph --bench effects_blocks`):
 
 | shape | picked | bytes | encode | decode |
 | --- | --- | --- | --- | --- |
@@ -443,7 +443,7 @@ case stays at or under v2's 340,001 bytes.
 
 ## Building a v3 payload
 
-`graph/src/runtime/effects_v3_emit.rs`, the mirror of `effects_v3_apply.rs` —
+`graph/src/effects/v3/emit.rs`, the mirror of `effects_v3_apply.rs` —
 and deliberately shaped like it:
 
     emit    Pending  --digest-->  Record  --encode-->  bytes
@@ -457,7 +457,7 @@ is a testable surface for the grouping — the emit tests assert on records rath
 than on decoded buffers — and a round-trip that compares values:
 `digest(pending) == read_buffer(encode(digest(pending)))`.
 
-The v2 emitter sits beside it in `effects_v2.rs`, whole and separate, so
+The v2 emitter sits beside it in `effects/v2/`, whole and separate, so
 retiring the old format is deleting a file rather than untangling one. Neither
 lives in `pending.rs`: a mutation accumulator should not know what a replication
 frame looks like. `Pending`'s fields are `pub(crate)` and the wire knowledge
@@ -515,7 +515,7 @@ the type internally and were discarding it.
 
 ## Applying a v3 payload
 
-`graph/src/runtime/effects_v3_apply.rs`. It lives in the `graph` crate rather
+`graph/src/effects/v3/apply.rs`. It lives in the `graph` crate rather
 than beside the v2 handler because it touches only graph types — no
 `redis_module` — which also lets it be tested against a real `Graph`.
 
@@ -551,7 +551,7 @@ replica rebuilds the same `IndexOptions` through the same
 
 ## v2 against v3, measured
 
-`cargo bench -p graph --bench effects_v2_vs_v3`, on
+`cargo bench -p graph --bench effects_versions`, on
 `UNWIND range(0,N-1) AS i CREATE (:Person {name:'n'+i, age:i%80})` — a string
 property and an int, which is a more representative payload than the
 single-int case quoted elsewhere in this document.
@@ -659,7 +659,7 @@ downgrade target must be v3-capable either way.
 
 ## What is implemented
 
-In `graph/src/runtime/effects_v3.rs`, codec only — no `Pending`, no `Graph`, so
+In `graph/src/effects/v3/`, codec only — no `Pending`, no `Graph`, so
 the format can be reviewed and tested byte-for-byte on its own.
 
 | | status |
@@ -712,7 +712,7 @@ does not fail on the far side, it makes C read misaligned bytes as a type and wr
 through the resulting pointer (the `AttributeSet_Update` segfault seen when feeding
 C our v2-ish buffers).
 
-What the unit tests do cover (`cargo test -p graph --lib effects_v3`, and
+What the unit tests do cover (`cargo test -p graph --lib effects`, and
 `--lib v3_tests` for the emit path):
 
 - **Byte-pinned records**, so a width change fails here rather than on the far side.

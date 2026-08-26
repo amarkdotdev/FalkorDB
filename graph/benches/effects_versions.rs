@@ -18,7 +18,7 @@
 //! which is the number that decides anything anyway.
 //!
 //! ```bash
-//! cargo bench -p graph --bench effects_v2_vs_v3
+//! cargo bench -p graph --bench effects_versions
 //! ```
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -26,8 +26,9 @@ use std::hint::black_box;
 
 use atomic_refcell::AtomicRefCell;
 use graph::{
+    effects::{v2, v3},
     graph::graph::Graph,
-    runtime::{effects_v2, effects_v3, effects_v3_emit, pending::Pending, value::Value},
+    runtime::{pending::Pending, value::Value},
 };
 
 /// Node counts spanning the range worth caring about: a single write, a small
@@ -101,11 +102,11 @@ fn report_sizes() {
     for n in SCALES {
         let (g, p) = fixture(n);
         let mut v2 = Vec::new();
-        effects_v2::build_effects_buffer(&p, &g, &mut v2);
+        v2::build_effects_buffer(&p, &g, &mut v2);
         let mut v3 = Vec::new();
-        effects_v3_emit::build_effects_buffer_v3(&p, &g, &mut v3);
+        v3::emit::build_effects_buffer_v3(&p, &g, &mut v3);
         let mut z = v3.clone();
-        effects_v3::maybe_compress(&mut z, 1, 1);
+        v3::maybe_compress(&mut z, 1, 1);
         println!(
             "  {n:>9} {:>13} {:>13} {:>6.1}% {:>11} {:>8.1}%",
             v2.len(),
@@ -129,14 +130,14 @@ fn encode(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("v2", n), &n, |b, _| {
             b.iter(|| {
                 let mut buf = Vec::new();
-                effects_v2::build_effects_buffer(black_box(&p), &g, &mut buf);
+                v2::build_effects_buffer(black_box(&p), &g, &mut buf);
                 black_box(buf.len())
             });
         });
         group.bench_with_input(BenchmarkId::new("v3", n), &n, |b, _| {
             b.iter(|| {
                 let mut buf = Vec::new();
-                effects_v3_emit::build_effects_buffer_v3(black_box(&p), &g, &mut buf);
+                v3::emit::build_effects_buffer_v3(black_box(&p), &g, &mut buf);
                 black_box(buf.len())
             });
         });
@@ -144,8 +145,8 @@ fn encode(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("v3+zstd-1", n), &n, |b, _| {
             b.iter(|| {
                 let mut buf = Vec::new();
-                effects_v3_emit::build_effects_buffer_v3(black_box(&p), &g, &mut buf);
-                effects_v3::maybe_compress(&mut buf, 1, 1);
+                v3::emit::build_effects_buffer_v3(black_box(&p), &g, &mut buf);
+                v3::maybe_compress(&mut buf, 1, 1);
                 black_box(buf.len())
             });
         });
@@ -158,23 +159,17 @@ fn decode(c: &mut Criterion) {
     for n in SCALES {
         let (g, p) = fixture(n);
         let mut plain = Vec::new();
-        effects_v3_emit::build_effects_buffer_v3(&p, &g, &mut plain);
+        v3::emit::build_effects_buffer_v3(&p, &g, &mut plain);
         let mut compressed = plain.clone();
-        effects_v3::maybe_compress(&mut compressed, 1, 1);
+        v3::maybe_compress(&mut compressed, 1, 1);
 
         group.sample_size(samples_for(n));
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::new("v3", n), &n, |b, _| {
-            b.iter(|| black_box(effects_v3::read_buffer(black_box(&plain)).unwrap().len()));
+            b.iter(|| black_box(v3::read_buffer(black_box(&plain)).unwrap().len()));
         });
         group.bench_with_input(BenchmarkId::new("v3+zstd-1", n), &n, |b, _| {
-            b.iter(|| {
-                black_box(
-                    effects_v3::read_buffer(black_box(&compressed))
-                        .unwrap()
-                        .len(),
-                )
-            });
+            b.iter(|| black_box(v3::read_buffer(black_box(&compressed)).unwrap().len()));
         });
     }
     group.finish();

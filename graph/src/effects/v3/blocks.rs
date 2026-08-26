@@ -504,8 +504,8 @@ pub fn read_attr_set(
 
 #[cfg(test)]
 mod tests {
-    use super::super::hex;
     use super::*;
+    use crate::effects::hex;
 
     // ── IdSet ──
 

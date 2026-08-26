@@ -19,20 +19,17 @@
 //! two engines had numbered them the same way.
 
 use crate::{
+    effects::v3::{
+        ConstraintKind, DecodeError, GraphEntity, INDEX_FLD_FULLTEXT, INDEX_FLD_VECTOR, Record,
+        SchemaType, read_buffer,
+    },
     entity_type::EntityType,
     graph::{
         constraint::{Constraint, ConstraintType},
         graph::{Graph, TypeId},
     },
     index::{IndexType, indexer::IndexOptions},
-    runtime::{
-        effects_v3::{
-            ConstraintKind, DecodeError, GraphEntity, INDEX_FLD_FULLTEXT, INDEX_FLD_VECTOR, Record,
-            SchemaType, read_buffer,
-        },
-        runtime::map_to_index_options,
-        value::Value,
-    },
+    runtime::{runtime::map_to_index_options, value::Value},
 };
 use roaring::RoaringTreemap;
 use rustc_hash::FxHashMap;
@@ -587,7 +584,7 @@ const _: () = assert!(GraphEntity::Node.as_u32() == 1 && GraphEntity::Edge.as_u3
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::effects_v3::{
+    use crate::effects::v3::{
         INDEX_FLD_RANGE, IndexField, new_buffer, write_add_attribute, write_add_schema,
         write_constraint, write_create_index, write_create_node, write_labels,
     };
@@ -775,7 +772,7 @@ mod tests {
         }
 
         let mut buf = Vec::new();
-        crate::runtime::effects_v3_emit::build_effects_buffer_v3(&p, &master, &mut buf);
+        crate::effects::v3::emit::build_effects_buffer_v3(&p, &master, &mut buf);
         assert_eq!(
             read_buffer(&buf).unwrap().len(),
             5,
@@ -811,7 +808,7 @@ mod tests {
         // A range index is the OR of three scalar kinds, so bit-testing is the
         // only thing that classifies it correctly.
         assert_eq!(
-            index_type_of(crate::runtime::effects_v3::INDEX_FLD_NUMERIC),
+            index_type_of(crate::effects::v3::INDEX_FLD_NUMERIC),
             IndexType::Range
         );
     }

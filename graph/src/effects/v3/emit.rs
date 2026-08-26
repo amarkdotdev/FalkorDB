@@ -22,12 +22,9 @@ use roaring::RoaringTreemap;
 use rustc_hash::FxHashMap;
 
 use crate::{
+    effects::v3::{self as v3, EffectEncode, GraphEntity, Record, SchemaType},
     graph::graph::Graph,
-    runtime::{
-        effects_v3::{self as v3, EffectEncode, GraphEntity, Record, SchemaType},
-        pending::Pending,
-        value::Value,
-    },
+    runtime::{pending::Pending, value::Value},
 };
 
 /// Build a v3 effects payload from what a query staged.
@@ -324,11 +321,9 @@ fn gather_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effects::v3::{GraphEntity, Record, SchemaType, read_buffer};
     use crate::graph::graphblas::test_init::ensure_init;
-    use crate::runtime::{
-        effects_v3::{GraphEntity, Record, SchemaType, read_buffer},
-        pending::{EFFECTS_EMIT_VERSION, Pending, emit_v3},
-    };
+    use crate::runtime::pending::{EFFECTS_EMIT_VERSION, Pending, emit_v3};
     use atomic_refcell::AtomicRefCell;
 
     fn graph() -> AtomicRefCell<Graph> {
@@ -599,7 +594,7 @@ mod tests {
         p.stage_created_node(1, &[], &[]);
 
         let mut v2 = Vec::new();
-        crate::runtime::effects_v2::build_effects_buffer(&p, &g, &mut v2);
+        crate::effects::v2::build_effects_buffer(&p, &g, &mut v2);
         let mut v3 = Vec::new();
         build_effects_buffer_v3(&p, &g, &mut v3);
 
@@ -672,7 +667,7 @@ mod tests {
         }
 
         let mut v2 = Vec::new();
-        crate::runtime::effects_v2::build_effects_buffer(&p, &g, &mut v2);
+        crate::effects::v2::build_effects_buffer(&p, &g, &mut v2);
         let mut v3 = Vec::new();
         build_effects_buffer_v3(&p, &g, &mut v3);
         println!("\n  10,000 nodes: v2 {} B -> v3 {} B", v2.len(), v3.len());

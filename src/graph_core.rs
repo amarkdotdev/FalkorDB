@@ -44,17 +44,15 @@ use crossfire::{
     mpsc::{Array, bounded_blocking},
 };
 use graph::{
+    effects::v2::{
+        EFFECT_CREATE_INDEX, EFFECT_DROP_INDEX, EFFECTS_VERSION, write_string, write_u16,
+    },
     graph::{
         graph::{Graph, Plan},
         mvcc_graph::MvccGraph,
     },
     planner::{IR, plan_is_non_deterministic},
-    runtime::{
-        effects_v2::{
-            EFFECT_CREATE_INDEX, EFFECT_DROP_INDEX, EFFECTS_VERSION, write_string, write_u16,
-        },
-        runtime::Runtime,
-    },
+    runtime::runtime::Runtime,
     threadpool::{pending_count, spawn},
 };
 use orx_tree::{Collection, Dfs, NodeRef};

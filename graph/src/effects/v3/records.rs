@@ -679,8 +679,8 @@ pub fn maybe_compress(
 
 #[cfg(test)]
 mod tests {
-    use super::super::hex;
     use super::*;
+    use crate::effects::hex;
 
     // ── records ──
 

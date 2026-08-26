@@ -109,17 +109,13 @@ impl<'a> Iterator for CommitOp<'a> {
                         let mut buf_ref = self.runtime.effects_buffer.borrow_mut();
                         let buf = buf_ref.get_or_insert_with(Vec::new);
                         let n_effects = if crate::runtime::pending::emit_v3() {
-                            crate::runtime::effects_v3_emit::build_effects_buffer_v3(
+                            crate::effects::v3::emit::build_effects_buffer_v3(
                                 &pending,
                                 &self.runtime.g,
                                 buf,
                             )
                         } else {
-                            crate::runtime::effects_v2::build_effects_buffer(
-                                &pending,
-                                &self.runtime.g,
-                                buf,
-                            )
+                            crate::effects::v2::build_effects_buffer(&pending, &self.runtime.g, buf)
                         };
                         self.runtime
                             .effects_count
@@ -128,7 +124,7 @@ impl<'a> Iterator for CommitOp<'a> {
                         // it rewrites everything after the header, so it has to
                         // see the finished record stream.
                         if crate::runtime::pending::emit_v3() {
-                            crate::runtime::effects_v3::maybe_compress(
+                            crate::effects::v3::maybe_compress(
                                 buf,
                                 crate::runtime::pending::compression_min_bytes(),
                                 crate::runtime::pending::EFFECTS_COMPRESSION_LEVEL,

@@ -195,8 +195,8 @@ pub fn write_string(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{BlockEncoding, read_id_set, write_id_set};
     use super::*;
+    use crate::effects::v3::{BlockEncoding, read_id_set, write_id_set};
 
     // ── malformed input ──
 

@@ -52,9 +52,9 @@ zstd = { version = "0.13.3", default-features = false, features = ["arrays", "le
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
-name = "effects_v3"
+name = "effects_blocks"
 harness = false
 
 [[bench]]
-name = "effects_v2_vs_v3"
+name = "effects_versions"
 harness = false

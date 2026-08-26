@@ -1,4 +1,4 @@
-//! Effects wire format v3 — see `docs/effects-v3.md`.
+//! Wire format **v3** — see `docs/effects-v3.md`.
 //!
 //! Every record is `u32 opcode · u32 count · blocks…`, built from five shared
 //! blocks. There is no separate "batch" record type: a record with `count == 1`
@@ -54,17 +54,21 @@ use crate::graph::graphblas::serialization::{index_field_type, si_type};
 /// but C must be raised to 3 as well before it can read what we write.
 pub const EFFECTS_VERSION: u8 = 3;
 
-mod blocks;
-mod error;
-mod reader;
-mod records;
-mod value;
+pub mod apply;
+pub mod blocks;
+pub mod emit;
+pub mod records;
+pub mod value;
 
 pub use blocks::*;
-pub use error::DecodeError;
-pub use reader::*;
 pub use records::*;
 pub use value::*;
+
+// The cursor, the primitive writers and the codec traits are shared across
+// versions, so they live a level up. Re-exported here so a record module can
+// say `use super::*` and get everything the wire needs.
+pub use super::reader::*;
+pub use super::{DecodeError, EffectDecode, EffectEncode, Reader};
 
 // ── effect types ──
 
@@ -362,35 +366,6 @@ si_tags!(
 /// unlike the rest it is stated here.
 pub const T_MAP: u32 = 1 << 0;
 
-// ── the codec traits ──
-
-/// Types that can write themselves into an effects payload of a given version.
-///
-/// Mirrors `serialization::Encode<VERSION>` on the RDB side, and for the same
-/// reason: the version belongs in the type system rather than in a module name,
-/// so a v4 lands as `impl EffectEncode<4> for Record` beside this one and the
-/// compiler picks between them.
-///
-/// The unit is a whole [`Record`]. Blocks stay free functions because they are
-/// sized by the record's `count`, which a `&self` encoder has no way to carry —
-/// the same reason the RDB traits grow `encode_with_range` / `decode_with_count`
-/// rather than folding counts into `encode`.
-pub trait EffectEncode<const VERSION: u8> {
-    fn encode(
-        &self,
-        buf: &mut Vec<u8>,
-    );
-}
-
-/// Types that can read themselves out of an effects payload of a given version.
-pub trait EffectDecode<const VERSION: u8>: Sized {
-    /// # Errors
-    ///
-    /// Returns [`DecodeError`] if the bytes are malformed, truncated, or
-    /// describe a shape this version does not have.
-    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError>;
-}
-
 // ── payload header ──
 
 /// The payload is a zstd frame, not records.
@@ -415,13 +390,4 @@ pub const KNOWN_FLAGS: u8 = FLAG_COMPRESSED;
 #[must_use]
 pub fn new_buffer() -> Vec<u8> {
     vec![EFFECTS_VERSION, 0]
-}
-
-/// Render bytes for the byte-pinning tests, which live beside what they pin.
-#[cfg(test)]
-pub(crate) fn hex(buf: &[u8]) -> String {
-    buf.iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ")
 }

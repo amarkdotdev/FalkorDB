@@ -12,19 +12,17 @@
 
 use crate::{config::CONFIGURATION_CACHE_SIZE, graph_core::ThreadedGraph, redis_type::GRAPH_TYPE};
 use graph::{
+    effects::v2::{
+        ATTR_NODE, ATTR_REL, EFFECT_ADD_ATTRIBUTE, EFFECT_ADD_SCHEMA, EFFECT_CREATE_EDGE,
+        EFFECT_CREATE_INDEX, EFFECT_CREATE_NODE, EFFECT_DELETE_EDGE, EFFECT_DELETE_NODE,
+        EFFECT_DROP_INDEX, EFFECT_REMOVE_LABELS, EFFECT_SET_LABELS, EFFECT_UPDATE_EDGE,
+        EFFECT_UPDATE_NODE, EFFECTS_VERSION, SCHEMA_NODE_LABEL, SCHEMA_REL_TYPE, read_string,
+        read_u16, read_u64, read_value,
+    },
     entity_type::EntityType,
     graph::graph::{Graph, TypeId},
     index::IndexType,
-    runtime::{
-        effects_v2::{
-            ATTR_NODE, ATTR_REL, EFFECT_ADD_ATTRIBUTE, EFFECT_ADD_SCHEMA, EFFECT_CREATE_EDGE,
-            EFFECT_CREATE_INDEX, EFFECT_CREATE_NODE, EFFECT_DELETE_EDGE, EFFECT_DELETE_NODE,
-            EFFECT_DROP_INDEX, EFFECT_REMOVE_LABELS, EFFECT_SET_LABELS, EFFECT_UPDATE_EDGE,
-            EFFECT_UPDATE_NODE, EFFECTS_VERSION, SCHEMA_NODE_LABEL, SCHEMA_REL_TYPE, read_string,
-            read_u16, read_u64, read_value,
-        },
-        value::Value,
-    },
+    runtime::value::Value,
 };
 use parking_lot::RwLock;
 use redis_module::{Context, NextArg, RedisResult, RedisString, RedisValue};
@@ -72,9 +70,8 @@ pub fn graph_effect(
         // accept every version it understands — that is what lets replicas be
         // upgraded before masters.
         match buf[0] {
-            graph::runtime::effects_v3::EFFECTS_VERSION => {
-                graph::runtime::effects_v3_apply::apply_effects_v3(&mut g, buf)
-                    .map_err(|e| e.to_string())
+            graph::effects::v3::EFFECTS_VERSION => {
+                graph::effects::v3::apply::apply_effects_v3(&mut g, buf).map_err(|e| e.to_string())
             }
             _ => apply_effects(&mut g, buf),
         }

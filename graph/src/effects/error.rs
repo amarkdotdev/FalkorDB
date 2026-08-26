@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use super::EFFECTS_VERSION;
+use super::v3::EFFECTS_VERSION;
 
 // ── decode errors ──
 
