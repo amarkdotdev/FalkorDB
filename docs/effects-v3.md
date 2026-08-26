@@ -763,14 +763,29 @@ lz4** — but on the evidence it should be on wherever both ends can read it.
 `build_effects` is set from replica presence alone (`graph_core.rs:686`), and
 `should_use_effects` consults `EFFECTS_THRESHOLD` only afterwards, on a buffer
 that has already been built. A query replicating verbatim therefore pays to
-construct a payload it then discards — which is why verbatim's master cost sits
-level with v3's (1052.0 against 1054.9) instead of near the 813.6 floor.
+construct a payload it then discards.
 
-Two measurements show it rather than argue it. Optimizing the writer dropped the
-stock verbatim master from 1052.0 to 893.7 Mi **without anything on the verbatim
-path changing** — it got faster because the payload it discards got cheaper to
-build. And forcing `build_effects` false drops it again, from 893.7 to 820.7 Mi,
-landing on the no-replica floor: the whole 73 Mi was the discarded encode.
+Three readings show that rather than argue it. The reference is a server with no
+replica attached, which does no replication work at all: that measured 813.6 and
+821.2 Mi at 100,000 nodes in two separate runs, so call the floor ~815–821 Mi and
+treat anything inside that band as sitting on it.
+
+| reading | master Mi at 100,000 | vs the floor |
+| --- | --- | --- |
+| stock verbatim, before the writer optimization | 1,052.0 | ~230 above |
+| stock verbatim, after it | 893.7 | ~75 above |
+| `build_effects` forced false | 820.7 | on it |
+
+The first line is the tell: verbatim's master sat level with v3's own 1,054.9
+rather than near the floor, because it was building the same payload v3 sends and
+then throwing it away. The second is the proof — optimizing the writer made the
+verbatim path 158 Mi cheaper **without anything on that path changing**, which can
+only happen if it was running the writer. The third removes the encode outright
+and lands on the floor, so the gap was the discarded payload.
+
+The three master readings come from three separate runs, as does each floor
+measurement; the 1% spread between the two floor readings is the scale of the
+drift, and every gap being argued here is far larger than that.
 
 That is why the table above uses the forced-false build. Measured against the
 stock verbatim path, v3 looked 0.87× — better than it is, because the baseline
