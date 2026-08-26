@@ -671,73 +671,72 @@ One label, one string property, one int — a single shape, which is v3's best
 case. 66 characters however many nodes it creates.
 
 **Instructions retired** (`ri_instructions` from `proc_pid_rusage` — not cycles,
-not wall-clock), plus bytes added to the replication stream. `none` is a server
-that never has a replica attached, so `build_effects` is false; it is the floor,
-not a choice. Each measurement uses a fresh graph and drops it afterwards,
-outside the window — without that, million-node graphs accumulate across modes
-and the machine is measuring paging.
+not wall-clock), plus bytes added to the replication stream. Each measurement
+uses a fresh graph and drops it outside the window; without that, million-node
+graphs accumulate and the machine measures paging.
+
+**Verbatim here is a build with `build_effects` forced false**, so no payload is
+constructed at all. That is the question worth asking — *what do effects cost
+against a system that does not have them* — and the stock verbatim path cannot
+answer it, because it builds a payload and discards it (see below). The
+no-effects master at 100,000 nodes reads 820.7 Mi against the 821.2 Mi measured
+on a server with no replica at all, which is the anchor saying the two runs are
+comparable.
 
 | nodes | mode | master Mi | replica Mi | total Mi | vs verbatim | wire bytes |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | none | 4.6 | — | 4.6 | — | 0 |
-| | verbatim | 13.4 | 4.6 | 18.0 | 1.00× | 113 |
+| 1 | **verbatim** | 13.4 | 4.6 | 18.0 | 1.00× | 103 |
 | | v2 | 13.4 | 4.1 | 17.5 | 0.97× | 156 |
-| | **v3** | 13.4 | 4.1 | 17.5 | 0.97× | 162 |
-| | v3+zstd | 13.4 | 4.1 | 17.4 | 0.97× | 168 |
-| 100 | none | 5.0 | — | 5.0 | — | 0 |
-| | verbatim | 14.2 | 5.4 | 19.6 | 1.00× | 116 |
-| | v2 | 14.1 | 5.6 | 19.8 | 1.01× | 4,111 |
-| | **v3** | 14.2 | 4.7 | 18.9 | **0.96×** | 2,958 |
-| | v3+zstd | 14.3 | 4.7 | 19.0 | 0.97× | 421 |
-| 1,000 | none | 13.0 | — | 13.0 | — | 0 |
-| | verbatim | 22.7 | 13.6 | 36.3 | 1.00× | 118 |
-| | v2 | 22.5 | 20.8 | 43.2 | 1.19× | 41,013 |
-| | **v3** | 22.7 | 10.9 | 33.6 | **0.93×** | 29,060 |
-| | v3+zstd | 23.1 | 11.1 | 34.2 | 0.94× | 1,878 |
-| 10,000 | none | 86.9 | — | 86.9 | — | 0 |
-| | verbatim | 103.3 | 88.9 | 192.2 | 1.00× | 120 |
-| | v2 | 101.9 | 160.3 | 262.2 | 1.36× | 419,015 |
-| | **v3** | 103.6 | 68.6 | 172.2 | **0.90×** | 299,062 |
-| | v3+zstd | 106.1 | 70.5 | 176.6 | 0.92× | 11,222 |
-| 100,000 | none | 821.2 | — | 821.2 | — | 0 |
-| | verbatim | 894.8 | 864.8 | 1,759.7 | 1.00× | 122 |
-| | v2 | 868.7 | 1,628.2 | 2,496.9 | 1.42× | 4,289,017 |
-| | **v3** | 883.6 | 648.8 | 1,532.4 | **0.87×** | 3,089,074 |
-| | v3+zstd | 912.3 | 656.1 | 1,568.5 | 0.89× | 39,226 |
-| 1,000,000 | none | 7,724.7 | — | 7,724.7 | — | 0 |
-| | verbatim | 9,387.7 | 8,421.1 | 17,808.7 | 1.00× | 124 |
-| | v2 | 9,092.6 | 17,860.0 | 26,952.6 | 1.51× | 43,889,019 |
-| | **v3** | 9,354.7 | 6,762.9 | 16,117.6 | **0.91×** | 31,889,281 |
-| | v3+zstd | 9,513.0 | 6,586.2 | 16,099.2 | 0.90× | 259,319 |
+| | v3 | 13.4 | 4.1 | 17.5 | 0.97× | 162 |
+| 100 | **verbatim** | 14.1 | 5.3 | 19.4 | 1.00× | 106 |
+| | v2 | 14.1 | 5.6 | 19.7 | 1.02× | 4,111 |
+| | v3 | 14.2 | 4.7 | 18.9 | 0.97× | 2,958 |
+| | v3+zstd | 14.3 | 4.7 | 19.0 | 0.98× | 421 |
+| 1,000 | **verbatim** | 21.8 | 13.0 | 34.8 | 1.00× | 108 |
+| | v2 | 22.5 | 20.8 | 43.3 | **1.24×** | 41,013 |
+| | v3 | 22.7 | 10.9 | 33.6 | 0.97× | 29,060 |
+| | v3+zstd | 23.1 | 11.1 | 34.2 | 0.98× | 1,878 |
+| 10,000 | **verbatim** | 96.6 | 84.2 | 180.8 | 1.00× | 111 |
+| | v2 | 101.9 | 160.3 | 262.2 | **1.45×** | 419,015 |
+| | v3 | 103.6 | 68.6 | 172.2 | 0.95× | 299,062 |
+| | v3+zstd | 106.1 | 70.5 | 176.6 | 0.98× | 11,222 |
+| 100,000 | **verbatim** | 820.7 | 803.5 | 1,624.2 | 1.00× | 113 |
+| | v2 | 868.7 | 1,628.2 | 2,496.9 | **1.54×** | 4,289,017 |
+| | v3 | 883.6 | 648.8 | 1,532.4 | 0.94× | 3,089,074 |
+| | v3+zstd | 912.3 | 656.1 | 1,568.4 | 0.97× | 39,226 |
+| 1,000,000 | **verbatim** | 8,544.2 | 7,696.5 | 16,240.7 | 1.00× | 115 |
+| | v2 | 9,092.6 | 17,860.0 | 26,952.6 | **1.66×** | 43,889,019 |
+| | v3 | 9,354.7 | 6,762.9 | 16,117.6 | 0.99× | 31,889,281 |
+| | v3+zstd | 9,513.0 | 6,586.2 | 16,099.2 | 0.99× | 259,319 |
 
-**v3 beats verbatim on CPU at every scale**, 0.87× to 0.97×, and the replica is
-always the reason — it applies records instead of re-running the query. **v2 does
-not**: level to n=100, then 1.19×, 1.36×, 1.42×, 1.51× as the per-entity records
-pile up on the replica.
+**v3 is break-even with not having effects at all** — 0.94× to 0.99×, never
+worse. It spends 3–10% more on the master to encode and gets it back on the
+replica, which applies records instead of re-running the query.
 
-**Verbatim's wire cost is constant at about 120 bytes** — it replicates the
-query, and the query does not grow. Effects replicate the result, so they scale
-with it: v3 is 257,000× verbatim at a million nodes.
+**v2 is not.** It is level to n=100 and then diverges: 1.24×, 1.45×, 1.54×,
+**1.66×** at a million nodes. Per-entity records mean a graph operation per
+entity, and the replica pays 2.3× what re-executing the query would have cost.
 
-This corrects a framing used loosely elsewhere in this document. v3 being 28%
-smaller than v2 is real, but neither is remotely competitive with verbatim on
-bandwidth, and no byte-shaving inside the effects format changes that. **For a
+**Verbatim's wire cost is constant at about 110 bytes.** It replicates the query,
+and the query does not grow; effects replicate the result, so v3 is 277,000×
+verbatim at a million nodes. Neither effects format is remotely competitive on
+bandwidth and no byte-shaving inside the format changes that. **For a
 deterministic bulk write, replicating the query is five orders of magnitude
 smaller than replicating its effects.**
 
-So the case for effects over verbatim is not bytes, and the CPU margin is 3-13%.
-It is:
+So the case for effects is not bytes, and against a system without them the CPU
+is a wash. It is:
 
 - **Correctness.** A non-deterministic query cannot be replicated verbatim at
-  all — `rand()`, `timestamp()`, anything reading the clock — and those must be
-  effects whatever the cost.
+  all — `rand()`, `timestamp()`, anything reading the clock. Those must be
+  effects whatever they cost.
 - **Engine independence.** A verbatim query needs a replica implementing the
   same query language the same way. A C replica cannot run Rust's planner, which
   is the whole reason the migration needs a wire format rather than a shared
   dialect.
 
-At n=1 the wire figures are command framing rather than payload — 113 to 168
-bytes — and nothing distinguishes the modes.
+What the table does say is that **v3 makes effects cost what not having them
+costs**, where v2 charged up to 1.66×. That is the honest claim.
 
 ### Compression is nearly free, and it is what makes the bytes bearable
 
@@ -759,7 +758,7 @@ encoder-only view priced the compression and not the copying it avoids, on
 either side. It still cannot be the default — **C vendors neither zstd nor
 lz4** — but on the evidence it should be on wherever both ends can read it.
 
-#### The verbatim baseline is inflated, and that narrows the margin
+#### Why the stock verbatim path could not be the baseline
 
 `build_effects` is set from replica presence alone (`graph_core.rs:686`), and
 `should_use_effects` consults `EFFECTS_THRESHOLD` only afterwards, on a buffer
@@ -767,20 +766,15 @@ that has already been built. A query replicating verbatim therefore pays to
 construct a payload it then discards — which is why verbatim's master cost sits
 level with v3's (1052.0 against 1054.9) instead of near the 813.6 floor.
 
-Optimizing the writer made this visible: verbatim's master fell from 1052.0 to
-893.7 M without anything on the verbatim path changing, purely because the
-payload it discards became cheaper to build.
+Two measurements show it rather than argue it. Optimizing the writer dropped the
+stock verbatim master from 1052.0 to 893.7 Mi **without anything on the verbatim
+path changing** — it got faster because the payload it discards got cheaper to
+build. And forcing `build_effects` false drops it again, from 893.7 to 820.7 Mi,
+landing on the no-replica floor: the whole 73 Mi was the discarded encode.
 
-Fix it properly and verbatim's master falls toward the 813.9 floor:
-
-| nodes | verbatim, encode not wasted | v3 | |
-| --- | --- | --- | --- |
-| 1,000 | ~37.4 | 41.5 | 1.11× |
-| 10,000 | ~190.7 | 183.8 | 0.96× |
-| 100,000 | ~1,677.4 | 1,557.7 | **0.93×** |
-
-So against a verbatim path that did not waste the encode, v3 is **level to 7%
-cheaper** at scale, and still worse on small writes.
+That is why the table above uses the forced-false build. Measured against the
+stock verbatim path, v3 looked 0.87× — better than it is, because the baseline
+was paying v3's own encoding cost.
 
 That is the honest position, and it does not change the case for v3, because CPU
 was never the case for v3. Verbatim replication cannot carry a non-deterministic
