@@ -607,54 +607,78 @@ v2 has no standalone decoder to compare against — its bytes are read and appli
 to a `Graph` in one pass, in the root crate — so this is v3 only. Decompression
 adds 12–25%.
 
-### Both sides of the link, in instructions
+### Both sides of the link, against verbatim
+
+**Verbatim is the baseline.** With a replica attached the choice is between
+replicating the query text and replicating effects; "no replica" is not one of
+the options, only the floor that says how much of the cost is replication at all.
 
 Wall-clock could not answer this. Measuring the modes in sequence drifted far
-enough that a master with **no replica** read slower than one replicating v2 —
+enough that a master with no replica read slower than one replicating v2 —
 impossible, and the tell that the window was dirty. `proc_pid_rusage` gives a
-running instruction total per pid and does not drift; the bench harness already
-has the reader (`falkorbench.counters.read_rusage`), so this borrows it.
+per-pid instruction total that does not drift; the bench harness already has the
+reader (`falkorbench.counters.read_rusage`), so this borrows it. `none` runs on a
+server that never has a replica attached, because detaching one to simulate it
+put disconnect handling inside the measurement window.
 
-Four modes, because "no replication" and "verbatim" are different things. `none`
-runs on a server that never has a replica attached, so `build_effects` is false
-and nothing is built. Millions of instructions, best of three:
+Millions of instructions, best of three, ratios against verbatim:
 
-| nodes | mode | master | replica | total | vs none |
+| nodes | mode | master | replica | total | vs verbatim |
 | --- | --- | --- | --- | --- | --- |
-| 1,000 | none | 16.9 | — | 16.9 | 1.00× |
-| | verbatim | 23.4 | 20.4 | 43.9 | 2.60× |
-| | v2 | 23.5 | 27.4 | 50.9 | 3.02× |
-| | **v3** | 25.6 | **17.7** | **43.3** | **2.57×** |
-| 10,000 | none | 91.8 | — | 91.8 | 1.00× |
-| | verbatim | 123.7 | 98.6 | 222.3 | 2.42× |
-| | v2 | 103.7 | 167.9 | 271.6 | 2.96× |
-| | **v3** | 124.2 | **77.6** | **201.9** | **2.20×** |
-| 100,000 | none | 813.6 | — | 813.6 | 1.00× |
-| | verbatim | 1052.0 | 866.0 | 1918.0 | 2.36× |
-| | v2 | 882.0 | 1645.8 | 2527.8 | 3.11× |
-| | **v3** | 1054.9 | **662.7** | **1717.7** | **2.11×** |
+| 1,000 | verbatim | 23.4 | 20.4 | 43.8 | 1.00× |
+| | v2 | 23.5 | 27.4 | 50.9 | 1.16× |
+| | **v3** | 25.6 | **17.7** | **43.3** | **0.99×** |
+| 10,000 | verbatim | 123.7 | 98.6 | 222.3 | 1.00× |
+| | v2 | 103.7 | 167.9 | 271.6 | 1.22× |
+| | **v3** | 124.2 | **77.6** | **201.8** | **0.91×** |
+| 100,000 | verbatim | 1052.0 | 866.0 | 1918.0 | 1.00× |
+| | v2 | 882.0 | 1645.8 | 2527.8 | 1.32× |
+| | **v3** | 1054.9 | **662.7** | **1717.6** | **0.90×** |
 
-**The replica is where v3 pays.** At 100,000 nodes it applies in 662.7 M
-instructions against v2's 1,645.8 M — **2.5× cheaper** — because a record covers
-every entity of its shape and lands as one bulk graph operation rather than one
-per entity. It is also below verbatim's 866.0 M, where the replica re-executes
-the query in full.
+*(the no-replication floor, for scale: 16.9 / 91.8 / 813.6 M — so replication is
+roughly 1.4× to 2.4× the cost of the write on its own.)*
 
-**On the master v3 costs about 20% more than v2** (1054.9 against 882.0), which
-is the encode cost the criterion figures above show directly. Whole-system, v3 is
-**32% cheaper than v2 and 10% cheaper than verbatim**.
+**v2 effects cost more than replicating the query text** — 1.16× to 1.32× — and
+the whole excess is on the replica, which applies them at up to 1.90× the cost
+of simply re-running the query. Per-entity records are why: a record per node
+means a graph operation per node.
 
-This is the correction to the query-latency figures: those measure the master
-only, where v3 *is* slower, and stopping there gets the sign of the whole trade
-wrong.
+**v3 is level with verbatim to 10% better**, and again the replica is the reason:
+0.77× at 100,000 nodes, because a record covers every entity of its shape and
+lands as one bulk operation. On the master v3 is level with verbatim (1.00×) and
+about 20% above v2, which is the encode cost the criterion figures show directly.
 
-**Verbatim does not save the master any encoding work.** `build_effects` is set
-from replica presence alone (`graph_core.rs:686`); `should_use_effects` consults
-`EFFECTS_THRESHOLD` only afterwards, on a buffer that has already been built. A
-query that replicates verbatim therefore pays to construct a payload it then
-discards — visible above as verbatim's master cost sitting level with v3's
-(1052.0 against 1054.9) rather than near the 813.6 baseline. The threshold saves
-network and replica work, not master CPU. Worth fixing independently of v3.
+This corrects the query-latency numbers above, which measure the master alone.
+Master-side, v3 is the slowest of the three; stopping there gets the sign of the
+whole trade wrong.
+
+#### The verbatim baseline is inflated, and that narrows the margin
+
+`build_effects` is set from replica presence alone (`graph_core.rs:686`), and
+`should_use_effects` consults `EFFECTS_THRESHOLD` only afterwards, on a buffer
+that has already been built. A query replicating verbatim therefore pays to
+construct a payload it then discards — which is why verbatim's master cost sits
+level with v3's (1052.0 against 1054.9) instead of near the 813.6 floor.
+
+Fix that and verbatim's master falls toward the floor, taking its total with it:
+
+| nodes | verbatim, encode not wasted | v3 | |
+| --- | --- | --- | --- |
+| 1,000 | ~37.3 | 43.3 | 1.16× |
+| 10,000 | ~190.4 | 201.8 | 1.06× |
+| 100,000 | ~1,679.6 | 1,717.6 | 1.02× |
+
+So v3's CPU advantage over verbatim is mostly an artifact of a bug on the
+verbatim path. Against a fixed verbatim, **v3 is roughly break-even** — a few
+percent worse at scale, worse than that on small writes.
+
+That is the honest position, and it does not change the case for v3, because CPU
+was never the case for v3. Verbatim replication cannot carry a non-deterministic
+query, cannot be read by an engine that does not share the query language
+implementation, and sends the query rather than its result — which is why C uses
+effects at all. v3 earns its place by being **32% cheaper than the effects
+format we have** and by being a format two engines can both read. The wasted
+encode on the verbatim path is worth fixing on its own merits.
 
 ## Migration and rollout
 
