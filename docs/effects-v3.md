@@ -659,7 +659,7 @@ now keeps three containers instead of one and clones the key twice for the first
 shape. Eighty-seven nanoseconds on a one-node write is not worth complicating
 the common path to recover.
 
-### What each mode actually puts on the wire
+### Every mode, every scale, both sides
 
 The query throughout is
 
@@ -667,87 +667,97 @@ The query throughout is
 UNWIND range(0,N-1) AS i CREATE (:Person {name:'n'+i, age:i%80})
 ```
 
-Bytes added to the replication stream by one such write, measured as the
-`master_repl_offset` delta:
+One label, one string property, one int — a single shape, which is v3's best
+case. 66 characters however many nodes it creates.
 
-| nodes | verbatim | v2 | v3 | v3 + zstd‑1 | v3 ÷ verbatim |
-| --- | --- | --- | --- | --- | --- |
-| 1,000 | **141 B** | 41,013 B | 29,060 B | 1,878 B | 206× |
-| 10,000 | **120 B** | 419,015 B | 299,062 B | 11,222 B | 2,492× |
-| 100,000 | **122 B** | 4,289,017 B | 3,089,074 B | 39,226 B | **25,320×** |
+**Instructions retired** (`ri_instructions` from `proc_pid_rusage` — not cycles,
+not wall-clock), plus bytes added to the replication stream. `none` is a server
+that never has a replica attached, so `build_effects` is false; it is the floor,
+not a choice. Each measurement uses a fresh graph and drops it afterwards,
+outside the window — without that, million-node graphs accumulate across modes
+and the machine is measuring paging.
 
-**Verbatim is constant at about 120 bytes** — it replicates the query, and this
-query is 66 characters however many nodes it creates. Effects replicate the
-*result*, so they scale with it.
+| nodes | mode | master Mi | replica Mi | total Mi | vs verbatim | wire bytes |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | none | 4.6 | — | 4.6 | — | 0 |
+| | verbatim | 13.4 | 4.6 | 18.0 | 1.00× | 113 |
+| | v2 | 13.4 | 4.1 | 17.5 | 0.97× | 156 |
+| | **v3** | 13.4 | 4.1 | 17.5 | 0.97× | 162 |
+| | v3+zstd | 13.4 | 4.1 | 17.4 | 0.97× | 168 |
+| 100 | none | 5.0 | — | 5.0 | — | 0 |
+| | verbatim | 14.2 | 5.4 | 19.6 | 1.00× | 116 |
+| | v2 | 14.1 | 5.6 | 19.8 | 1.01× | 4,111 |
+| | **v3** | 14.2 | 4.7 | 18.9 | **0.96×** | 2,958 |
+| | v3+zstd | 14.3 | 4.7 | 19.0 | 0.97× | 421 |
+| 1,000 | none | 13.0 | — | 13.0 | — | 0 |
+| | verbatim | 22.7 | 13.6 | 36.3 | 1.00× | 118 |
+| | v2 | 22.5 | 20.8 | 43.2 | 1.19× | 41,013 |
+| | **v3** | 22.7 | 10.9 | 33.6 | **0.93×** | 29,060 |
+| | v3+zstd | 23.1 | 11.1 | 34.2 | 0.94× | 1,878 |
+| 10,000 | none | 86.9 | — | 86.9 | — | 0 |
+| | verbatim | 103.3 | 88.9 | 192.2 | 1.00× | 120 |
+| | v2 | 101.9 | 160.3 | 262.2 | 1.36× | 419,015 |
+| | **v3** | 103.6 | 68.6 | 172.2 | **0.90×** | 299,062 |
+| | v3+zstd | 106.1 | 70.5 | 176.6 | 0.92× | 11,222 |
+| 100,000 | none | 821.2 | — | 821.2 | — | 0 |
+| | verbatim | 894.8 | 864.8 | 1,759.7 | 1.00× | 122 |
+| | v2 | 868.7 | 1,628.2 | 2,496.9 | 1.42× | 4,289,017 |
+| | **v3** | 883.6 | 648.8 | 1,532.4 | **0.87×** | 3,089,074 |
+| | v3+zstd | 912.3 | 656.1 | 1,568.5 | 0.89× | 39,226 |
+| 1,000,000 | none | 7,724.7 | — | 7,724.7 | — | 0 |
+| | verbatim | 9,387.7 | 8,421.1 | 17,808.7 | 1.00× | 124 |
+| | v2 | 9,092.6 | 17,860.0 | 26,952.6 | 1.51× | 43,889,019 |
+| | **v3** | 9,354.7 | 6,762.9 | 16,117.6 | **0.91×** | 31,889,281 |
+| | v3+zstd | 9,513.0 | 6,586.2 | 16,099.2 | 0.90× | 259,319 |
 
-This corrects a framing used loosely elsewhere in this document. v3 is 28%
-smaller than v2, and that comparison is real; but neither is remotely
-competitive with verbatim on bandwidth, and no amount of byte-shaving inside the
-effects format changes that. For a deterministic bulk write, **replicating the
-query is four orders of magnitude smaller than replicating its effects.**
+**v3 beats verbatim on CPU at every scale**, 0.87× to 0.97×, and the replica is
+always the reason — it applies records instead of re-running the query. **v2 does
+not**: level to n=100, then 1.19×, 1.36×, 1.42×, 1.51× as the per-entity records
+pile up on the replica.
 
-So the case for effects over verbatim is not bytes and is barely CPU (11%). It
-is:
+**Verbatim's wire cost is constant at about 120 bytes** — it replicates the
+query, and the query does not grow. Effects replicate the result, so they scale
+with it: v3 is 257,000× verbatim at a million nodes.
+
+This corrects a framing used loosely elsewhere in this document. v3 being 28%
+smaller than v2 is real, but neither is remotely competitive with verbatim on
+bandwidth, and no byte-shaving inside the effects format changes that. **For a
+deterministic bulk write, replicating the query is five orders of magnitude
+smaller than replicating its effects.**
+
+So the case for effects over verbatim is not bytes, and the CPU margin is 3-13%.
+It is:
 
 - **Correctness.** A non-deterministic query cannot be replicated verbatim at
-  all — `rand()`, `timestamp()`, or anything reading wall-clock diverges the
-  replica. Those *must* be effects.
-- **Engine independence.** A verbatim query needs a replica that implements the
-  same query language the same way. A C replica cannot run Rust's planner. This
+  all — `rand()`, `timestamp()`, anything reading the clock — and those must be
+  effects whatever the cost.
+- **Engine independence.** A verbatim query needs a replica implementing the
+  same query language the same way. A C replica cannot run Rust's planner, which
   is the whole reason the migration needs a wire format rather than a shared
   dialect.
-- **The replica does not re-execute.** Measured below: v3's replica spends 662.9
-  M instructions against verbatim's 863.5 M.
 
-The bandwidth cost is the price of those, and compression is what makes it
-tolerable: 39 KB against 4.3 MB at 100,000 nodes, still 321× verbatim.
+At n=1 the wire figures are command framing rather than payload — 113 to 168
+bytes — and nothing distinguishes the modes.
 
-### Both sides of the link, against verbatim
+### Compression is nearly free, and it is what makes the bytes bearable
 
-**Verbatim is the baseline.** With a replica attached the choice is between
-replicating the query text and replicating effects; "no replica" is not one of
-the options, only the floor that says how much of the cost is replication at all.
+| nodes | v3 CPU | + zstd‑1 | CPU cost | v3 wire | + zstd‑1 | saving |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1,000 | 33.6 Mi | 34.2 Mi | +1.8% | 29,060 B | 1,878 B | 15× |
+| 10,000 | 172.2 | 176.6 | +2.6% | 299,062 | 11,222 | 27× |
+| 100,000 | 1,532.4 | 1,568.5 | +2.4% | 3,089,074 | 39,226 | 79× |
+| 1,000,000 | 16,117.6 | 16,099.2 | **−0.1%** | 31,889,281 | 259,319 | **123×** |
 
-Wall-clock could not answer this. Measuring the modes in sequence drifted far
-enough that a master with no replica read slower than one replicating v2 —
-impossible, and the tell that the window was dirty. `proc_pid_rusage` gives a
-per-pid instruction total that does not drift; the bench harness already has the
-reader (`falkorbench.counters.read_rusage`), so this borrows it. `none` runs on a
-server that never has a replica attached, because detaching one to simulate it
-put disconnect handling inside the measurement window.
+Whole-system, compression costs about 2% of instructions and removes 93–99% of
+the bytes. At a million nodes it is free within noise: what the compressor
+spends, the master saves not copying 31 MB into the replica output buffer and
+the replica saves not reading it.
 
-Millions of **instructions retired** — `ri_instructions` from
-`proc_pid_rusage`, not cycles and not wall-clock. Best of three, ratios against
-verbatim:
-
-| nodes | mode | master | replica | total | vs verbatim |
-| --- | --- | --- | --- | --- | --- |
-| 1,000 | verbatim | 23.5 | 20.5 | 44.1 | 1.00× |
-| | v2 | 23.4 | 27.5 | 51.0 | 1.16× |
-| | **v3** | 23.8 | **17.7** | **41.5** | **0.94×** |
-| 10,000 | verbatim | 105.4 | 98.9 | 204.3 | 1.00× |
-| | v2 | 104.5 | 167.9 | 272.4 | 1.33× |
-| | **v3** | 105.5 | **78.3** | **183.8** | **0.90×** |
-| 100,000 | verbatim | 893.7 | 863.5 | 1757.2 | 1.00× |
-| | v2 | 882.3 | 1641.1 | 2523.4 | 1.44× |
-| | **v3** | 894.8 | **662.9** | **1557.7** | **0.89×** |
-
-*(the no-replication floor, for scale: 16.9 / 91.8 / 813.6 M — so replication is
-roughly 1.4× to 2.4× the cost of the write on its own.)*
-
-**v2 effects cost more than replicating the query text** — 1.16× to 1.32× — and
-the whole excess is on the replica, which applies them at up to 1.90× the cost
-of simply re-running the query. Per-entity records are why: a record per node
-means a graph operation per node.
-
-**v3 is level with verbatim to 10% better**, and again the replica is the reason:
-0.77× at 100,000 nodes, because a record covers every entity of its shape and
-lands as one bulk operation. On the master v3 is level with verbatim (1.00×) and
-about 20% above v2, which is the encode cost the criterion figures show directly.
-
-This corrects the query-latency numbers above, which measure the master alone.
-Master-side, v3 is the slowest of the three; stopping there gets the sign of the
-whole trade wrong.
+That is a better case than the encoder-only measurement suggested, where zstd
+looked like 3.245 cycles/byte against a 0.067 memcpy. The difference is that the
+encoder-only view priced the compression and not the copying it avoids, on
+either side. It still cannot be the default — **C vendors neither zstd nor
+lz4** — but on the evidence it should be on wherever both ends can read it.
 
 #### The verbatim baseline is inflated, and that narrows the margin
 
