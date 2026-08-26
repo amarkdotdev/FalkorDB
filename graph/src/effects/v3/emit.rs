@@ -40,18 +40,21 @@ pub fn build_effects_buffer_v3(
         buf.extend_from_slice(&v3::new_buffer());
     }
     let mut n = 0;
-    for record in digest(p, g) {
+    for_each_record(p, g, |record| {
         record.encode(buf);
         n += 1;
-    }
+    });
     n
 }
 
-/// Every record a committed `Pending` implies, in apply order.
+/// Every record a committed `Pending` implies, in apply order, handed to `out`
+/// one at a time.
 ///
 /// Eager in the grouping — a shape's members are only known once every entity
-/// has been seen — but the records themselves are yielded one at a time, so
-/// peak memory is the group map plus one record rather than all of them.
+/// has been seen — but records go out as they are built, so peak memory is one
+/// stage's group map plus one record rather than every record at once. The
+/// mirror of the apply path, which decodes one record and applies it rather
+/// than materializing them all.
 ///
 /// The shapes are **not** pre-grouped inside `Pending`, deliberately.
 /// Attributes accumulate incrementally — `set_node_attribute` inserts into a
@@ -59,11 +62,12 @@ pub fn build_effects_buffer_v3(
 /// twice, and pre-bucketing would mean re-bucketing on every attribute write.
 /// It would also charge every write for a grouping most never use, since
 /// effects are only built when something is actually replicating.
-pub fn digest(
+pub fn for_each_record(
     p: &Pending,
     g: &AtomicRefCell<Graph>,
-) -> Vec<Record> {
-    let mut out = Vec::new();
+    mut out: impl FnMut(Record),
+) {
+    let out = &mut out;
 
     // Schema and attribute additions first, each carrying its id. That ordering
     // is normative in v3, not incidental: the ids on every later record are
@@ -76,7 +80,7 @@ pub fn digest(
             .enumerate()
             .skip(p.schema_label_count)
         {
-            out.push(Record::AddSchema {
+            out(Record::AddSchema {
                 schema_type: SchemaType::Node,
                 id: offset as i32,
                 name: label.to_string(),
@@ -88,7 +92,7 @@ pub fn digest(
             .enumerate()
             .skip(p.schema_rel_type_count)
         {
-            out.push(Record::AddSchema {
+            out(Record::AddSchema {
                 schema_type: SchemaType::Edge,
                 id: offset as i32,
                 name: rel_type.to_string(),
@@ -105,33 +109,46 @@ pub fn digest(
             .enumerate()
             .skip(p.schema_node_attr_count)
         {
-            out.push(Record::AddAttribute {
+            out(Record::AddAttribute {
                 id: offset as u16,
                 name: attr.to_string(),
             });
         }
     }
 
-    digest_created_nodes(p, &mut out);
-    digest_created_edges(p, g, &mut out);
-    digest_updates(&p.existing_nodes_attrs, GraphEntity::Node, &mut out);
-    digest_updates(&p.existing_relationships_attrs, GraphEntity::Edge, &mut out);
+    digest_created_nodes(p, out);
+    digest_created_edges(p, g, out);
+    digest_updates(&p.existing_nodes_attrs, GraphEntity::Node, out);
+    digest_updates(&p.existing_relationships_attrs, GraphEntity::Edge, out);
     // A created node carries its labels in its CREATE_NODE record already.
-    digest_labels(&p.set_labels, Some(&p.created_nodes), true, &mut out);
-    digest_labels(&p.remove_labels, None, false, &mut out);
+    digest_labels(&p.set_labels, Some(&p.created_nodes), true, out);
+    digest_labels(&p.remove_labels, None, false, out);
     // Edges before nodes, so the replica unhooks first.
-    digest_deleted_edges(p, &mut out);
+    digest_deleted_edges(p, out);
     if !p.deleted_nodes.is_empty() {
-        out.push(Record::DeleteNode {
+        out(Record::DeleteNode {
             ids: p.deleted_nodes.iter().collect(),
         });
     }
+}
+
+/// Every record, materialized.
+///
+/// Convenient for tests and for comparing two payloads; the emit path streams
+/// through [`for_each_record`] instead, so it never holds more than one record.
+#[must_use]
+pub fn digest(
+    p: &Pending,
+    g: &AtomicRefCell<Graph>,
+) -> Vec<Record> {
+    let mut out = Vec::new();
+    for_each_record(p, g, |record| out.push(record));
     out
 }
 
 fn digest_created_nodes(
     p: &Pending,
-    out: &mut Vec<Record>,
+    out: &mut impl FnMut(Record),
 ) {
     // Shape key: the node's labels and its attribute ids. Labels are sorted
     // because `set_labels` keeps caller order — [7,8] and [8,7] are the same
@@ -155,7 +172,7 @@ fn digest_created_nodes(
     }
     for ((labels, attr_ids), ids) in sorted_groups(groups) {
         let rows = gather_rows(&ids, &attr_ids, &p.new_nodes_attrs);
-        out.push(Record::CreateNode {
+        out(Record::CreateNode {
             ids,
             labels,
             attr_ids,
@@ -167,7 +184,7 @@ fn digest_created_nodes(
 fn digest_created_edges(
     p: &Pending,
     g: &AtomicRefCell<Graph>,
-    out: &mut Vec<Record>,
+    out: &mut impl FnMut(Record),
 ) {
     if p.created_rels_by_type.is_empty() {
         return;
@@ -200,7 +217,7 @@ fn digest_created_edges(
             let src: Vec<u64> = rows.iter().map(|r| r.1).collect();
             let dst: Vec<u64> = rows.iter().map(|r| r.2).collect();
             let values = gather_rows(&ids, &attr_ids, &p.new_relationships_attrs);
-            out.push(Record::CreateEdge {
+            out(Record::CreateEdge {
                 ids,
                 relation_id,
                 src,
@@ -214,7 +231,7 @@ fn digest_created_edges(
 
 fn digest_deleted_edges(
     p: &Pending,
-    out: &mut Vec<Record>,
+    out: &mut impl FnMut(Record),
 ) {
     let mut groups: FxHashMap<u64, Vec<(u64, u64, u64)>> = FxHashMap::default();
     for &(rel_id, type_id, from, to) in &p.deleted_endpoints {
@@ -226,7 +243,7 @@ fn digest_deleted_edges(
     }
     for (type_id, mut rows) in sorted_groups(groups) {
         rows.sort_unstable();
-        out.push(Record::DeleteEdge {
+        out(Record::DeleteEdge {
             ids: rows.iter().map(|r| r.0).collect(),
             relation_id: type_id as i32,
             src: rows.iter().map(|r| r.1).collect(),
@@ -239,7 +256,7 @@ fn digest_deleted_edges(
 fn digest_updates(
     attrs: &FxHashMap<u64, Vec<(u16, Value)>>,
     entity: GraphEntity,
-    out: &mut Vec<Record>,
+    out: &mut impl FnMut(Record),
 ) {
     let mut groups: FxHashMap<Vec<u16>, Vec<u64>> = FxHashMap::default();
     for (id, pairs) in attrs {
@@ -249,7 +266,7 @@ fn digest_updates(
     for (attr_ids, mut ids) in sorted_groups(groups) {
         ids.sort_unstable();
         let rows = gather_rows(&ids, &attr_ids, attrs);
-        out.push(Record::Update {
+        out(Record::Update {
             entity,
             ids,
             attr_ids,
@@ -266,7 +283,7 @@ fn digest_labels(
     labels: &FxHashMap<u64, Vec<u64>>,
     skip: Option<&RoaringTreemap>,
     add: bool,
-    out: &mut Vec<Record>,
+    out: &mut impl FnMut(Record),
 ) {
     let mut groups: FxHashMap<Vec<i32>, Vec<u64>> = FxHashMap::default();
     for (&id, label_ids) in labels {
@@ -280,7 +297,7 @@ fn digest_labels(
     }
     for (labels, mut ids) in sorted_groups(groups) {
         ids.sort_unstable();
-        out.push(Record::Labels { add, ids, labels });
+        out(Record::Labels { add, ids, labels });
     }
 }
 

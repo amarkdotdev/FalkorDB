@@ -26,7 +26,7 @@ use std::hint::black_box;
 
 use atomic_refcell::AtomicRefCell;
 use graph::{
-    effects::{v2, v3},
+    effects::{EffectEncode, v2, v3},
     graph::graph::Graph,
     runtime::{pending::Pending, value::Value},
 };
@@ -244,5 +244,62 @@ fn stream_vs_materialize(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, encode, decode, stream_vs_materialize);
+/// The emit side of the same question: streaming records into the buffer
+/// against collecting them first. Same two payload shapes as the decode case.
+fn encode_shape(c: &mut Criterion) {
+    let mut group = c.benchmark_group("encode_shape");
+    for n in [1_000_usize, 10_000, 100_000] {
+        let one = fixture(n);
+        let many = {
+            ensure_graphblas();
+            let g = AtomicRefCell::new(Graph::new(64, 64, 0, 0, "bench"));
+            {
+                let mut graph = g.borrow_mut();
+                graph.get_label_id_mut("Person");
+                for i in 0..n {
+                    graph.add_node_attribute_name(&format!("p{i}"));
+                }
+            }
+            let mut p = Pending::default();
+            p.set_schema_baseline(&g);
+            for id in 0..n as u64 {
+                p.stage_created_node(id, &[0], &[(id as u16, Value::Int(id as i64))]);
+            }
+            (g, p)
+        };
+
+        group.sample_size(samples_for(n));
+        for (shape, (g, p)) in [("1shape", &one), ("Nshapes", &many)] {
+            group.throughput(Throughput::Elements(n as u64));
+            // What the code did before: build every record, then encode them.
+            group.bench_with_input(
+                BenchmarkId::new(format!("collect/{shape}"), n),
+                &n,
+                |b, _| {
+                    b.iter(|| {
+                        let mut buf = v3::new_buffer();
+                        for record in v3::emit::digest(black_box(p), g) {
+                            record.encode(&mut buf);
+                        }
+                        black_box(buf.len())
+                    });
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new(format!("stream/{shape}"), n),
+                &n,
+                |b, _| {
+                    b.iter(|| {
+                        let mut buf = Vec::new();
+                        v3::emit::build_effects_buffer_v3(black_box(p), g, &mut buf);
+                        black_box(buf.len())
+                    });
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(benches, encode, decode, stream_vs_materialize, encode_shape);
 criterion_main!(benches);

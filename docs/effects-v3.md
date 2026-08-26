@@ -631,6 +631,29 @@ replicates asynchronously. It becomes clearly worth it when compression is on
 is the constraint. Nothing here is a reason to move the `EFFECTS_VERSION`
 default; the reason for v3 is that two engines can read it.
 
+### Records are streamed in both directions
+
+Neither side materializes a record list. Emit hands each record to a sink as it
+is built (`for_each_record`); apply decodes one, applies it, and drops it. The
+collecting forms — `digest` and `read_buffer` — remain for tests and for
+comparing two payloads, and are built on the streaming ones.
+
+Emit, measured (`-- encode_shape`):
+
+| records | payload | collect | stream | |
+| --- | --- | --- | --- | --- |
+| 1,000 | 1 record | 57.9 µs | 55.3 µs | −4.5% |
+| 1,000 | N records | 182 µs | 181 µs | −0.6% |
+| 10,000 | 1 record | 522 µs | 507 µs | −2.9% |
+| 10,000 | N records | 1.94 ms | 1.94 ms | −0.1% |
+| 100,000 | 1 record | 6.36 ms | 6.09 ms | −4.2% |
+| 100,000 | N records | 20.3 ms | 18.7 ms | **−7.6%** |
+
+Smaller than the decode gain, because emit was already dominated by building the
+group maps and cloning row values — dropping the record vector removes an
+allocation and a walk, not the bulk of the work. It is still on the GIL-holding
+write thread, which is where the cheapest wins are worth taking.
+
 ### Records are applied as they are decoded
 
 The apply path decodes one record, applies it, and drops it, rather than
