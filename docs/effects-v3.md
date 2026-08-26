@@ -607,12 +607,13 @@ v2 has no standalone decoder to compare against — its bytes are read and appli
 to a `Graph` in one pass, in the root crate — so this is v3 only. Decompression
 adds 12–25%.
 
-### Where the v3 writer spends its cycles
+### Where the v3 writer spends its time
 
 100,000 nodes of one shape, `cargo bench -p graph --bench effects_versions --
-writer_breakdown`. The id and attribute blocks are measured directly; the
-grouping and row gathering are what is left of the whole encode once those are
-removed.
+writer_breakdown`. **Wall-clock**, via criterion — every table in this section
+is time; the instruction counts further down are the only ones that are not. The
+id and attribute blocks are measured directly; the grouping and row gathering are
+what is left of the whole encode once those are removed.
 
 | stage | before | after | share now |
 | --- | --- | --- | --- |
@@ -658,6 +659,49 @@ now keeps three containers instead of one and clones the key twice for the first
 shape. Eighty-seven nanoseconds on a one-node write is not worth complicating
 the common path to recover.
 
+### What each mode actually puts on the wire
+
+The query throughout is
+
+```cypher
+UNWIND range(0,N-1) AS i CREATE (:Person {name:'n'+i, age:i%80})
+```
+
+Bytes added to the replication stream by one such write, measured as the
+`master_repl_offset` delta:
+
+| nodes | verbatim | v2 | v3 | v3 + zstd‑1 | v3 ÷ verbatim |
+| --- | --- | --- | --- | --- | --- |
+| 1,000 | **141 B** | 41,013 B | 29,060 B | 1,878 B | 206× |
+| 10,000 | **120 B** | 419,015 B | 299,062 B | 11,222 B | 2,492× |
+| 100,000 | **122 B** | 4,289,017 B | 3,089,074 B | 39,226 B | **25,320×** |
+
+**Verbatim is constant at about 120 bytes** — it replicates the query, and this
+query is 66 characters however many nodes it creates. Effects replicate the
+*result*, so they scale with it.
+
+This corrects a framing used loosely elsewhere in this document. v3 is 28%
+smaller than v2, and that comparison is real; but neither is remotely
+competitive with verbatim on bandwidth, and no amount of byte-shaving inside the
+effects format changes that. For a deterministic bulk write, **replicating the
+query is four orders of magnitude smaller than replicating its effects.**
+
+So the case for effects over verbatim is not bytes and is barely CPU (11%). It
+is:
+
+- **Correctness.** A non-deterministic query cannot be replicated verbatim at
+  all — `rand()`, `timestamp()`, or anything reading wall-clock diverges the
+  replica. Those *must* be effects.
+- **Engine independence.** A verbatim query needs a replica that implements the
+  same query language the same way. A C replica cannot run Rust's planner. This
+  is the whole reason the migration needs a wire format rather than a shared
+  dialect.
+- **The replica does not re-execute.** Measured below: v3's replica spends 662.9
+  M instructions against verbatim's 863.5 M.
+
+The bandwidth cost is the price of those, and compression is what makes it
+tolerable: 39 KB against 4.3 MB at 100,000 nodes, still 321× verbatim.
+
 ### Both sides of the link, against verbatim
 
 **Verbatim is the baseline.** With a replica attached the choice is between
@@ -672,7 +716,9 @@ reader (`falkorbench.counters.read_rusage`), so this borrows it. `none` runs on 
 server that never has a replica attached, because detaching one to simulate it
 put disconnect handling inside the measurement window.
 
-Millions of instructions, best of three, ratios against verbatim:
+Millions of **instructions retired** — `ri_instructions` from
+`proc_pid_rusage`, not cycles and not wall-clock. Best of three, ratios against
+verbatim:
 
 | nodes | mode | master | replica | total | vs verbatim |
 | --- | --- | --- | --- | --- | --- |
