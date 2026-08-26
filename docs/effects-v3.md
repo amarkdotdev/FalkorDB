@@ -631,6 +631,39 @@ replicates asynchronously. It becomes clearly worth it when compression is on
 is the constraint. Nothing here is a reason to move the `EFFECTS_VERSION`
 default; the reason for v3 is that two engines can read it.
 
+### Records are applied as they are decoded
+
+The apply path decodes one record, applies it, and drops it, rather than
+materializing every record and then walking them. `open_payload` consumes the
+header and hands back a `Records` stream; a compressed payload is still inflated
+whole first, because a zstd frame cannot be read in pieces.
+
+`Records` is deliberately **not** an `Iterator`. `next` returning `None` for
+"malformed" is exactly the mistake that applies a prefix of a corrupt buffer, so
+`next_record` returns `Option<Result<..>>` and a decode failure stops the caller.
+
+Measured (`cargo bench -p graph --bench effects_versions -- decode_shape`):
+
+| records | payload | materialize | stream | |
+| --- | --- | --- | --- | --- |
+| 1,000 | 1 record | 38.5 µs | 37.5 µs | −2.8% |
+| 1,000 | N records | 55.6 µs | 52.0 µs | −6.5% |
+| 10,000 | 1 record | 393 µs | 396 µs | +0.8% |
+| 10,000 | N records | 587 µs | 514 µs | **−12.4%** |
+| 100,000 | 1 record | 4.05 ms | 4.01 ms | −1.0% |
+| 100,000 | N records | 4.55 ms | 3.59 ms | **−21.1%** |
+
+The gain tracks record count, not node count, which is what the two payload
+shapes separate: one record covering N nodes has nothing to stream, while N
+singleton records had N decoded records live at once and their memory walked
+twice. At one record the difference is inside the noise in both directions.
+
+**The more robust win is the bound, not the percentage.** Live decoded state is
+now one record whatever the payload holds, where it was proportional to the
+record count. And this measures *decode*, which is a fraction of what a replica
+spends — the graph mutations dominate — so the end-to-end effect on replica
+apply is smaller than these figures.
+
 ## Migration and rollout
 
 Both engines must speak v3 before either emits it. C accepts `≤ its own version`,

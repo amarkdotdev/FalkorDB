@@ -593,11 +593,62 @@ impl EffectDecode<3> for Record {
     }
 }
 
-/// Read a whole `GRAPH.EFFECT` payload: the header, then every record.
+/// A payload with its header consumed, ready to yield records.
+///
+/// Owns the plaintext only when it had to decompress; an uncompressed payload
+/// is borrowed straight from the caller's buffer.
+pub enum Payload<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
+}
+
+impl Payload<'_> {
+    /// The record stream, decoded one at a time.
+    #[must_use]
+    pub fn records(&self) -> Records<'_> {
+        Records {
+            r: Reader::new(match self {
+                Self::Borrowed(b) => b,
+                Self::Owned(v) => v,
+            }),
+        }
+    }
+}
+
+/// Records decoded on demand.
+///
+/// Not an `Iterator`, because a decode failure has to stop the caller rather
+/// than be silently treated as the end of the stream — `Iterator::next`
+/// returning `None` for "malformed" is exactly the mistake that applies a
+/// prefix of a corrupt buffer.
+pub struct Records<'a> {
+    r: Reader<'a>,
+}
+
+impl Records<'_> {
+    /// The next record, or `None` at the end of the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] if the next record is malformed.
+    pub fn next_record(&mut self) -> Option<Result<Record, DecodeError>> {
+        if self.r.is_empty() {
+            return None;
+        }
+        Some(<Record as EffectDecode<3>>::decode(&mut self.r))
+    }
+}
+
+/// Consume a `GRAPH.EFFECT` payload's header, leaving the records.
 ///
 /// One command carries one payload carries many records — batching removes
 /// per-record framing, it never multiplies commands.
-pub fn read_buffer(buf: &[u8]) -> Result<Vec<Record>, DecodeError> {
+///
+/// # Errors
+///
+/// Returns [`DecodeError`] if the version is unreadable, a flag is unknown, or
+/// a compressed frame is malformed.
+pub fn open_payload(buf: &[u8]) -> Result<Payload<'_>, DecodeError> {
     let mut r = Reader::new(buf);
     let version = r.u8()?;
     if version != EFFECTS_VERSION {
@@ -608,32 +659,42 @@ pub fn read_buffer(buf: &[u8]) -> Result<Vec<Record>, DecodeError> {
         return Err(DecodeError::UnknownFlags(flags));
     }
 
-    if flags & FLAG_COMPRESSED != 0 {
-        let plain_len = r.u32()? as usize;
-        let frame = r.take(r.remaining())?;
-        let plain = zstd::stream::decode_all(frame)
-            .map_err(|e| DecodeError::BadCompression(e.to_string()))?;
-        // The declared length is a cross-check, not a hint: a frame that
-        // expands to something else means the header and the payload disagree,
-        // and the records after it cannot be trusted.
-        if plain.len() != plain_len {
-            return Err(DecodeError::CompressedLengthMismatch {
-                declared: plain_len,
-                actual: plain.len(),
-            });
-        }
-        return read_records(&plain);
+    if flags & FLAG_COMPRESSED == 0 {
+        return Ok(Payload::Borrowed(r.rest()));
     }
 
-    read_records(r.rest())
+    // A frame has to be whole before any of it can be read, so this is the one
+    // place the payload cannot be streamed.
+    let plain_len = r.u32()? as usize;
+    let frame = r.take(r.remaining())?;
+    let plain =
+        zstd::stream::decode_all(frame).map_err(|e| DecodeError::BadCompression(e.to_string()))?;
+    // The declared length is a cross-check, not a hint: a frame that expands to
+    // something else means the header and the payload disagree, and the records
+    // after it cannot be trusted.
+    if plain.len() != plain_len {
+        return Err(DecodeError::CompressedLengthMismatch {
+            declared: plain_len,
+            actual: plain.len(),
+        });
+    }
+    Ok(Payload::Owned(plain))
 }
 
-/// Every record in an already-plaintext record stream.
-fn read_records(buf: &[u8]) -> Result<Vec<Record>, DecodeError> {
-    let mut r = Reader::new(buf);
+/// Every record in a payload, materialized.
+///
+/// Convenient for tests and for comparing two payloads; the apply path streams
+/// instead, so it never holds more than one record at a time.
+///
+/// # Errors
+///
+/// Returns [`DecodeError`] if the payload or any record in it is malformed.
+pub fn read_buffer(buf: &[u8]) -> Result<Vec<Record>, DecodeError> {
+    let payload = open_payload(buf)?;
     let mut records = Vec::new();
-    while !r.is_empty() {
-        records.push(<Record as EffectDecode<3>>::decode(&mut r)?);
+    let mut stream = payload.records();
+    while let Some(record) = stream.next_record() {
+        records.push(record?);
     }
     Ok(records)
 }

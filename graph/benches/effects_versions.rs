@@ -175,5 +175,74 @@ fn decode(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, encode, decode);
+/// Materializing every record before touching the graph, against decoding one
+/// at a time.
+///
+/// Two shapes, because they answer different questions. **One shape** is the
+/// motivating query: a single record however many nodes it covers, so streaming
+/// can only win the cost of one `Vec`. **Every node its own shape** is the
+/// pathological end — N records live at once under the old scheme — and is
+/// where holding them all should show.
+fn stream_vs_materialize(c: &mut Criterion) {
+    let mut group = c.benchmark_group("decode_shape");
+    for n in [1_000_usize, 10_000, 100_000] {
+        let one = {
+            let (g, p) = fixture(n);
+            let mut b = Vec::new();
+            v3::emit::build_effects_buffer_v3(&p, &g, &mut b);
+            b
+        };
+        // One record per node: distinct attribute ids make distinct shapes.
+        let many = {
+            ensure_graphblas();
+            let g = AtomicRefCell::new(Graph::new(64, 64, 0, 0, "bench"));
+            {
+                let mut graph = g.borrow_mut();
+                graph.get_label_id_mut("Person");
+                for i in 0..n {
+                    graph.add_node_attribute_name(&format!("p{i}"));
+                }
+            }
+            let mut p = Pending::default();
+            p.set_schema_baseline(&g);
+            for id in 0..n as u64 {
+                p.stage_created_node(id, &[0], &[(id as u16, Value::Int(id as i64))]);
+            }
+            let mut b = Vec::new();
+            v3::emit::build_effects_buffer_v3(&p, &g, &mut b);
+            b
+        };
+
+        group.sample_size(samples_for(n));
+        for (shape, buf) in [("1shape", &one), ("Nshapes", &many)] {
+            group.throughput(Throughput::Elements(n as u64));
+            group.bench_with_input(
+                BenchmarkId::new(format!("materialize/{shape}"), n),
+                buf,
+                |b, buf| {
+                    b.iter(|| black_box(v3::read_buffer(black_box(buf)).unwrap().len()));
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new(format!("stream/{shape}"), n),
+                buf,
+                |b, buf| {
+                    b.iter(|| {
+                        let payload = v3::open_payload(black_box(buf)).unwrap();
+                        let mut s = payload.records();
+                        let mut count = 0_usize;
+                        while let Some(rec) = s.next_record() {
+                            black_box(rec.unwrap());
+                            count += 1;
+                        }
+                        black_box(count)
+                    });
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(benches, encode, decode, stream_vs_materialize);
 criterion_main!(benches);

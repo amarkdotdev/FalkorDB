@@ -21,7 +21,7 @@
 use crate::{
     effects::v3::{
         ConstraintKind, DecodeError, GraphEntity, INDEX_FLD_FULLTEXT, INDEX_FLD_VECTOR, Record,
-        SchemaType, read_buffer,
+        SchemaType, open_payload,
     },
     entity_type::EntityType,
     graph::{
@@ -146,11 +146,20 @@ pub fn apply_effects_v3(
     g: &mut Graph,
     buf: &[u8],
 ) -> Result<(), ApplyError> {
-    let records = read_buffer(buf)?;
+    // Decode one record, apply it, drop it. The alternative — decoding every
+    // record first — holds the whole buffer's worth of owned ids, labels and
+    // values before touching the graph, and walks that memory twice. Streaming
+    // keeps a record hot in cache between being decoded and being applied, and
+    // caps live decoded state at one record whatever the payload holds.
+    //
+    // A compressed payload still has to be inflated whole before any of it can
+    // be read; `open_payload` owns that plaintext and the records borrow from it.
+    let payload = open_payload(buf)?;
+    let mut stream = payload.records();
     let mut ops = IndexOps::default();
 
-    for record in records {
-        apply_record(g, record, &mut ops)?;
+    while let Some(record) = stream.next_record() {
+        apply_record(g, record?, &mut ops)?;
     }
 
     g.commit_index(&mut ops.add_docs, &mut ops.remove_docs);
@@ -774,7 +783,7 @@ mod tests {
         let mut buf = Vec::new();
         crate::effects::v3::emit::build_effects_buffer_v3(&p, &master, &mut buf);
         assert_eq!(
-            read_buffer(&buf).unwrap().len(),
+            crate::effects::v3::read_buffer(&buf).unwrap().len(),
             5,
             "2 schema + 1 attr + 2 shapes"
         );
