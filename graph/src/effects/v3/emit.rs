@@ -154,22 +154,56 @@ fn digest_created_nodes(
     // because `set_labels` keeps caller order — [7,8] and [8,7] are the same
     // shape, and emitting them ascending is what makes two engines that agree
     // on the set produce the same bytes.
-    let mut groups: FxHashMap<(Vec<i32>, Vec<u16>), Vec<u64>> = FxHashMap::default();
+    //
+    // The key is built into a scratch pair that is cleared and refilled per
+    // node, and only cloned when the shape turns out to be new. Collecting a
+    // fresh `Vec` per node instead cost two heap allocations for every node —
+    // 200,000 of them for 100,000 nodes, and 39% of the whole encode — for keys
+    // that are overwhelmingly duplicates of one already in the map.
+    // Removing the per-node allocation alone moved little: the cost is hashing
+    // the key, not building it. So the map is consulted only when the shape
+    // actually changes. Entities of one shape arrive in runs — the overwhelming
+    // case is a query that creates one shape throughout, where this hashes once
+    // and then compares a two-element slice per node.
+    let mut shapes: Vec<(Vec<i32>, Vec<u16>)> = Vec::new();
+    let mut buckets: Vec<Vec<u64>> = Vec::new();
+    let mut index: FxHashMap<(Vec<i32>, Vec<u16>), usize> = FxHashMap::default();
+    let mut last: Option<usize> = None;
+
+    let mut key: (Vec<i32>, Vec<u16>) = (Vec::new(), Vec::new());
     for id in &p.created_nodes {
-        let mut labels: Vec<i32> = p
-            .set_labels
-            .get(&id)
-            .map(|l| l.iter().map(|&v| v as i32).collect())
-            .unwrap_or_default();
-        labels.sort_unstable();
-        labels.dedup();
-        let attr_ids: Vec<u16> = p
-            .new_nodes_attrs
-            .get(&id)
-            .map(|a| a.iter().map(|(aid, _)| *aid).collect())
-            .unwrap_or_default();
-        groups.entry((labels, attr_ids)).or_default().push(id);
+        let (labels, attr_ids) = &mut key;
+        labels.clear();
+        if let Some(l) = p.set_labels.get(&id) {
+            labels.extend(l.iter().map(|&v| v as i32));
+            labels.sort_unstable();
+            labels.dedup();
+        }
+        attr_ids.clear();
+        if let Some(a) = p.new_nodes_attrs.get(&id) {
+            attr_ids.extend(a.iter().map(|(aid, _)| *aid));
+        }
+
+        let slot = match last {
+            Some(i) if shapes[i] == key => i,
+            _ => {
+                let i = if let Some(&i) = index.get(&key) {
+                    i
+                } else {
+                    shapes.push(key.clone());
+                    buckets.push(Vec::new());
+                    index.insert(key.clone(), shapes.len() - 1);
+                    shapes.len() - 1
+                };
+                last = Some(i);
+                i
+            }
+        };
+        buckets[slot].push(id);
     }
+
+    let groups: FxHashMap<(Vec<i32>, Vec<u16>), Vec<u64>> =
+        shapes.into_iter().zip(buckets).collect();
     for ((labels, attr_ids), ids) in sorted_groups(groups) {
         let rows = gather_rows(&ids, &attr_ids, &p.new_nodes_attrs);
         out(Record::CreateNode {
@@ -323,13 +357,25 @@ fn gather_rows(
 ) -> Vec<Value> {
     let mut rows = Vec::with_capacity(ids.len() * attr_ids.len());
     for id in ids {
-        let entity = attrs.get(id);
-        for attr_id in attr_ids {
-            rows.push(
-                entity
-                    .and_then(|a| a.iter().find(|(aid, _)| aid == attr_id))
-                    .map_or(Value::Null, |(_, v)| v.clone()),
-            );
+        let Some(pairs) = attrs.get(id) else {
+            rows.resize(rows.len() + attr_ids.len(), Value::Null);
+            continue;
+        };
+        // Both sides are sorted by attribute id — the shape was built from these
+        // very vectors — so this is a merge, not a search per cell. Scanning for
+        // each cell made the cost quadratic in the shape's width: unnoticeable
+        // at two attributes, not at twenty.
+        let mut j = 0;
+        for &attr_id in attr_ids {
+            while j < pairs.len() && pairs[j].0 < attr_id {
+                j += 1;
+            }
+            if j < pairs.len() && pairs[j].0 == attr_id {
+                rows.push(pairs[j].1.clone());
+                j += 1;
+            } else {
+                rows.push(Value::Null);
+            }
         }
     }
     rows
@@ -618,6 +664,84 @@ mod tests {
         // The version byte is what a reader dispatches on, so it has to differ.
         assert_eq!(v2[0], 2);
         assert_eq!(v3[0], 3);
+    }
+
+    #[test]
+    fn gather_rows_merges_rather_than_searching() {
+        // Within a group every entity has exactly the shape's attributes, so the
+        // merge normally walks in lockstep. These are the cases that are not
+        // that, because the merge has to behave like the scan it replaced: an
+        // entity missing a middle attribute, one missing a trailing attribute,
+        // and one absent from the map entirely.
+        let mut attrs: FxHashMap<u64, Vec<(u16, Value)>> = FxHashMap::default();
+        attrs.insert(1, vec![(0, Value::Int(10)), (2, Value::Int(12))]); // no attr 1
+        attrs.insert(2, vec![(0, Value::Int(20))]); // no attr 1 or 2
+        attrs.insert(
+            3,
+            vec![
+                (0, Value::Int(30)),
+                (1, Value::Int(31)),
+                (2, Value::Int(32)),
+            ],
+        );
+
+        let rows = gather_rows(&[1, 2, 3, 4], &[0, 1, 2], &attrs);
+        assert_eq!(
+            rows,
+            vec![
+                Value::Int(10),
+                Value::Null,
+                Value::Int(12),
+                Value::Int(20),
+                Value::Null,
+                Value::Null,
+                Value::Int(30),
+                Value::Int(31),
+                Value::Int(32),
+                // id 4 is not in the map at all
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_scratch_shape_key_groups_exactly_as_a_fresh_one_would() {
+        // The key is a reused scratch pair now, cloned only when the shape is
+        // new. Clearing it wrongly would smear one node's shape onto the next,
+        // which shows up as too few groups.
+        let g = graph();
+        let mut p = Pending::default();
+        p.set_schema_baseline(&g);
+        // Alternating widths, so a stale scratch would merge them.
+        for id in 0..100u64 {
+            if id % 2 == 0 {
+                p.stage_created_node(id, &[0], &[(0, Value::Int(id as i64))]);
+            } else {
+                p.stage_created_node(
+                    id,
+                    &[0, 1],
+                    &[(0, Value::Int(id as i64)), (1, Value::Int(1))],
+                );
+            }
+        }
+        let records = digest(&p, &g);
+        assert_eq!(records.len(), 2, "two shapes, two records");
+        for r in &records {
+            let Record::CreateNode {
+                ids,
+                labels,
+                attr_ids,
+                rows,
+            } = r
+            else {
+                panic!("wrong record");
+            };
+            assert_eq!(ids.len(), 50);
+            assert_eq!(rows.len(), ids.len() * attr_ids.len());
+            assert_eq!(labels.len(), attr_ids.len(), "1 label/1 attr, or 2 and 2");
+        }
     }
 
     #[test]

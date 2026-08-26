@@ -610,38 +610,53 @@ adds 12–25%.
 ### Where the v3 writer spends its cycles
 
 100,000 nodes of one shape, `cargo bench -p graph --bench effects_versions --
-writer_breakdown`. The id and attribute blocks are measured directly; the row
-gathering is what is left of the whole encode once the other three are removed,
-and is labelled as inferred rather than measured.
+writer_breakdown`. The id and attribute blocks are measured directly; the
+grouping and row gathering are what is left of the whole encode once those are
+removed.
 
-| stage | ms | share |
-| --- | --- | --- |
-| grouping — building the shape keys | 2.21 | **39%** |
-| row gathering — *by difference* | 2.51 | **44%** |
-| writing values (`AttrSet`) | 0.70 | 12% |
-| roaring ids (`IdSet`) | 0.31 | 5% |
-| whole encode | 5.72 | 100% |
+| stage | before | after | share now |
+| --- | --- | --- | --- |
+| grouping + row gathering | 4.72 ms | **2.04 ms** | 67% |
+| writing values (`AttrSet`) | 0.70 ms | 0.70 ms | 23% |
+| roaring ids (`IdSet`) | 0.31 ms | 0.32 ms | 10% |
+| whole encode | 5.73 ms | **3.05 ms** | 100% |
 
-**Only 18% of the writer writes bytes.** The other 82% is the batching
-machinery — deciding which entities share a shape and collecting their values
-into row-major order. That is the whole of v3's cost over v2, which walks its
-entities and writes them without ever grouping.
+The writer started at 18% of its time actually writing bytes and 82% in the
+batching machinery — deciding which entities share a shape and collecting their
+values row-major. Two changes took that to 33/67 and cut the whole encode by
+**46%**:
 
-Roaring is not the expense, which is worth saying because it is the part that
-looks expensive: 5%.
+- **The shape key no longer allocates per node.** It is built into a scratch
+  pair that is cleared and refilled, and cloned only when the shape turns out to
+  be new. Collecting a fresh `Vec` per node meant 200,000 heap allocations for
+  100,000 nodes, for keys that are overwhelmingly duplicates.
+- **The map is consulted only when the shape changes.** Removing the allocation
+  alone moved almost nothing — the cost was *hashing* the key, not building it.
+  Entities of one shape arrive in runs, so remembering the last shape and
+  comparing against it turns the common case into one hash for the whole query
+  and a two-element slice comparison per node.
+- **`gather_rows` merges instead of searching.** Both the shape and the entity's
+  attribute vector are sorted by attribute id, so a merge walk replaces a linear
+  `find` per cell. That was quadratic in the shape's width — unnoticeable at two
+  attributes, not at twenty.
 
-Two specific things account for most of it, both fixable and neither fixed here:
+Roaring is not the expense, at 10%, which is worth saying because it is the part
+that looks expensive.
 
-- **The shape key allocates twice per node.** `digest_created_nodes` builds a
-  `Vec<i32>` of labels and a `Vec<u16>` of attribute ids for *every* node purely
-  to use as a `HashMap` key — 200,000 heap allocations for 100,000 nodes, before
-  any hashing. A key that borrows, or an interned shape id, removes it.
-- **`gather_rows` is quadratic in the shape's width.** For each cell it does
-  `attrs.get(id)` and then a linear `find` over that entity's attribute vector.
-  Both sides are already sorted by attribute id, so a merge walk would make it
-  linear; at two attributes the difference is small, at twenty it is not.
+Encode against v2 across the scales, after:
 
-Neither changes the wire format, so both can land after it is settled.
+| nodes | v2 | v3 before | v3 after | |
+| --- | --- | --- | --- | --- |
+| 100 | 2.08 µs | 5.98 µs | 3.86 µs | 1.86× v2 |
+| 1,000 | 21.7 µs | 54.6 µs | 33.0 µs | 1.52× |
+| 10,000 | 206 µs | 482 µs | 286 µs | 1.39× |
+| 100,000 | 2.38 ms | 5.55 ms | 3.07 ms | 1.29× |
+| 1,000,000 | 69.8 ms | 146 ms | **78.9 ms** | **1.13×** |
+
+A single-node write got slightly worse — 324 ns to 411 ns — because the grouping
+now keeps three containers instead of one and clones the key twice for the first
+shape. Eighty-seven nanoseconds on a one-node write is not worth complicating
+the common path to recover.
 
 ### Both sides of the link, against verbatim
 
@@ -661,15 +676,15 @@ Millions of instructions, best of three, ratios against verbatim:
 
 | nodes | mode | master | replica | total | vs verbatim |
 | --- | --- | --- | --- | --- | --- |
-| 1,000 | verbatim | 23.4 | 20.4 | 43.8 | 1.00× |
-| | v2 | 23.5 | 27.4 | 50.9 | 1.16× |
-| | **v3** | 25.6 | **17.7** | **43.3** | **0.99×** |
-| 10,000 | verbatim | 123.7 | 98.6 | 222.3 | 1.00× |
-| | v2 | 103.7 | 167.9 | 271.6 | 1.22× |
-| | **v3** | 124.2 | **77.6** | **201.8** | **0.91×** |
-| 100,000 | verbatim | 1052.0 | 866.0 | 1918.0 | 1.00× |
-| | v2 | 882.0 | 1645.8 | 2527.8 | 1.32× |
-| | **v3** | 1054.9 | **662.7** | **1717.6** | **0.90×** |
+| 1,000 | verbatim | 23.5 | 20.5 | 44.1 | 1.00× |
+| | v2 | 23.4 | 27.5 | 51.0 | 1.16× |
+| | **v3** | 23.8 | **17.7** | **41.5** | **0.94×** |
+| 10,000 | verbatim | 105.4 | 98.9 | 204.3 | 1.00× |
+| | v2 | 104.5 | 167.9 | 272.4 | 1.33× |
+| | **v3** | 105.5 | **78.3** | **183.8** | **0.90×** |
+| 100,000 | verbatim | 893.7 | 863.5 | 1757.2 | 1.00× |
+| | v2 | 882.3 | 1641.1 | 2523.4 | 1.44× |
+| | **v3** | 894.8 | **662.9** | **1557.7** | **0.89×** |
 
 *(the no-replication floor, for scale: 16.9 / 91.8 / 813.6 M — so replication is
 roughly 1.4× to 2.4× the cost of the write on its own.)*
@@ -696,17 +711,20 @@ that has already been built. A query replicating verbatim therefore pays to
 construct a payload it then discards — which is why verbatim's master cost sits
 level with v3's (1052.0 against 1054.9) instead of near the 813.6 floor.
 
-Fix that and verbatim's master falls toward the floor, taking its total with it:
+Optimizing the writer made this visible: verbatim's master fell from 1052.0 to
+893.7 M without anything on the verbatim path changing, purely because the
+payload it discards became cheaper to build.
+
+Fix it properly and verbatim's master falls toward the 813.9 floor:
 
 | nodes | verbatim, encode not wasted | v3 | |
 | --- | --- | --- | --- |
-| 1,000 | ~37.3 | 43.3 | 1.16× |
-| 10,000 | ~190.4 | 201.8 | 1.06× |
-| 100,000 | ~1,679.6 | 1,717.6 | 1.02× |
+| 1,000 | ~37.4 | 41.5 | 1.11× |
+| 10,000 | ~190.7 | 183.8 | 0.96× |
+| 100,000 | ~1,677.4 | 1,557.7 | **0.93×** |
 
-So v3's CPU advantage over verbatim is mostly an artifact of a bug on the
-verbatim path. Against a fixed verbatim, **v3 is roughly break-even** — a few
-percent worse at scale, worse than that on small writes.
+So against a verbatim path that did not waste the encode, v3 is **level to 7%
+cheaper** at scale, and still worse on small writes.
 
 That is the honest position, and it does not change the case for v3, because CPU
 was never the case for v3. Verbatim replication cannot carry a non-deterministic
