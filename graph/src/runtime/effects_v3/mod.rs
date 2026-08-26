@@ -362,10 +362,30 @@ si_tags!(
 /// unlike the rest it is stated here.
 pub const T_MAP: u32 = 1 << 0;
 
-/// Start a fresh buffer, stamped with the version header.
+// ── payload header ──
+
+/// The payload is a zstd frame, not records.
+///
+/// When set, a `u32` uncompressed length follows the flags byte and the frame
+/// follows that. The header itself is never compressed, so a reader always
+/// knows what it is holding before it commits to decoding anything.
+pub const FLAG_COMPRESSED: u8 = 1 << 0;
+
+/// Every flag this build understands. A reader that meets a bit outside this
+/// mask **rejects the buffer** rather than guessing: an old node reading a
+/// future payload must fail loudly, not decode the first record it recognises
+/// and corrupt itself with the rest.
+pub const KNOWN_FLAGS: u8 = FLAG_COMPRESSED;
+
+/// Start a fresh buffer: `u8 version · u8 flags`.
+///
+/// The flags byte is reserved from day one even though nothing sets it by
+/// default. Adding it later would have meant another version bump for a single
+/// byte, which is the whole reason it is here now rather than when compression
+/// is first switched on.
 #[must_use]
 pub fn new_buffer() -> Vec<u8> {
-    vec![EFFECTS_VERSION]
+    vec![EFFECTS_VERSION, 0]
 }
 
 /// Render bytes for the byte-pinning tests, which live beside what they pin.

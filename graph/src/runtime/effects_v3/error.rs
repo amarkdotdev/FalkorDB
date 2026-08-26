@@ -60,6 +60,18 @@ pub enum DecodeError {
     #[error("unknown effect opcode {0}")]
     BadOpcode(u32),
 
+    /// A payload flag this build does not understand. Rejected rather than
+    /// ignored: decoding the records anyway would apply a prefix of something
+    /// whose shape is unknown.
+    #[error("effects payload sets unknown flags {0:#04x}")]
+    UnknownFlags(u8),
+
+    #[error("malformed compressed effects payload: {0}")]
+    BadCompression(String),
+
+    #[error("compressed payload declares {declared} bytes but expands to {actual}")]
+    CompressedLengthMismatch { declared: usize, actual: usize },
+
     #[error("unknown schema type {0}")]
     BadSchemaType(u32),
 

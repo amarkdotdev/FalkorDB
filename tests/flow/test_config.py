@@ -44,6 +44,7 @@ class testConfig(FlowTestsBase):
                 ("MAX_INFO_QUERIES", 1000),
                 ("EFFECTS_THRESHOLD", 300),
                 ("EFFECTS_VERSION", 2),
+                ("EFFECTS_COMPRESSION", 0),
                 ("BOLT_PORT", 65535),
                 ("DELAY_INDEXING", 0),
                 ("IMPORT_FOLDER", "/var/lib/FalkorDB/import/"),

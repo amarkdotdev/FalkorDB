@@ -39,7 +39,8 @@ pub fn build_effects_buffer_v3(
     buf: &mut Vec<u8>,
 ) -> u64 {
     if buf.is_empty() {
-        buf.push(v3::EFFECTS_VERSION);
+        // Through new_buffer, so the flags byte cannot be forgotten here.
+        buf.extend_from_slice(&v3::new_buffer());
     }
     let mut n = 0;
     for record in digest(p, g) {

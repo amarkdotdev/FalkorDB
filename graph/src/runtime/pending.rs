@@ -51,6 +51,29 @@ pub static EFFECTS_EMIT_VERSION: AtomicI64 = AtomicI64::new(2);
 pub fn emit_v3() -> bool {
     EFFECTS_EMIT_VERSION.load(Ordering::Relaxed) >= 3
 }
+
+/// Smallest v3 payload worth compressing, in bytes. **0 disables it.**
+///
+/// Off by default because compression is a bandwidth trade, not a CPU one:
+/// measured at 3.245 cycles/byte to compress against 0.067 to copy into the
+/// replica output buffer, so on a fast link it spends far more than the bytes
+/// are worth. Worth turning on when the replication link, not the write thread,
+/// is the constraint.
+///
+/// v2 ignores this — only v3 reserves a flags byte to say a payload is
+/// compressed.
+pub static EFFECTS_COMPRESSION: AtomicI64 = AtomicI64::new(0);
+
+/// zstd level for [`EFFECTS_COMPRESSION`]. Level 1: the measurements behind the
+/// default-off decision were taken there, and higher levels cost more CPU for
+/// little on payloads this shape.
+pub const EFFECTS_COMPRESSION_LEVEL: i32 = 1;
+
+/// The size threshold, as a `usize`. Negative or absurd values read as off.
+#[must_use]
+pub fn compression_min_bytes() -> usize {
+    usize::try_from(EFFECTS_COMPRESSION.load(Ordering::Relaxed)).unwrap_or(0)
+}
 use crate::{
     entity_type::EntityType,
     graph::{

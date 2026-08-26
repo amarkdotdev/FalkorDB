@@ -124,6 +124,16 @@ impl<'a> Iterator for CommitOp<'a> {
                         self.runtime
                             .effects_count
                             .set(self.runtime.effects_count.get() + n_effects);
+                        // Compression is the last thing to touch the payload:
+                        // it rewrites everything after the header, so it has to
+                        // see the finished record stream.
+                        if crate::runtime::pending::emit_v3() {
+                            crate::runtime::effects_v3::maybe_compress(
+                                buf,
+                                crate::runtime::pending::compression_min_bytes(),
+                                crate::runtime::pending::EFFECTS_COMPRESSION_LEVEL,
+                            );
+                        }
                     } else {
                         // Keep the count accurate for `modified` bookkeeping
                         // even when the buffer itself is not needed.

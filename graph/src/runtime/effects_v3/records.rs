@@ -483,7 +483,7 @@ fn read_singular(
     })
 }
 
-/// Read a whole `GRAPH.EFFECT` payload: the version byte, then every record.
+/// Read a whole `GRAPH.EFFECT` payload: the header, then every record.
 ///
 /// One command carries one payload carries many records — batching removes
 /// per-record framing, it never multiplies commands.
@@ -493,11 +493,78 @@ pub fn read_buffer(buf: &[u8]) -> Result<Vec<Record>, DecodeError> {
     if version != EFFECTS_VERSION {
         return Err(DecodeError::UnsupportedVersion(version));
     }
+    let flags = r.u8()?;
+    if flags & !KNOWN_FLAGS != 0 {
+        return Err(DecodeError::UnknownFlags(flags));
+    }
+
+    if flags & FLAG_COMPRESSED != 0 {
+        let plain_len = r.u32()? as usize;
+        let frame = r.take(r.remaining())?;
+        let plain = zstd::stream::decode_all(frame)
+            .map_err(|e| DecodeError::BadCompression(e.to_string()))?;
+        // The declared length is a cross-check, not a hint: a frame that
+        // expands to something else means the header and the payload disagree,
+        // and the records after it cannot be trusted.
+        if plain.len() != plain_len {
+            return Err(DecodeError::CompressedLengthMismatch {
+                declared: plain_len,
+                actual: plain.len(),
+            });
+        }
+        return read_records(&plain);
+    }
+
+    read_records(r.rest())
+}
+
+/// Every record in an already-plaintext record stream.
+fn read_records(buf: &[u8]) -> Result<Vec<Record>, DecodeError> {
+    let mut r = Reader::new(buf);
     let mut records = Vec::new();
     while !r.is_empty() {
         records.push(read_record(&mut r)?);
     }
     Ok(records)
+}
+
+/// Compress a finished payload in place, if that makes it smaller.
+///
+/// **Default off.** Compression is a bandwidth trade, not a CPU one: measured
+/// at 3.245 cycles/byte to compress against 0.067 to copy into the replica
+/// output buffer, so on a fast link it spends far more than the bytes are
+/// worth. `min_bytes` of 0 disables it entirely, which is what
+/// `EFFECTS_COMPRESSION` defaults to.
+///
+/// Even when enabled the smaller form wins: zstd inflates an already-minimal
+/// buffer, and the batched records are already most of the way there.
+///
+/// Returns whether the payload ended up compressed.
+pub fn maybe_compress(
+    buf: &mut Vec<u8>,
+    min_bytes: usize,
+    level: i32,
+) -> bool {
+    const HEADER: usize = 2;
+    if min_bytes == 0 || buf.len() < HEADER || buf.len() - HEADER < min_bytes {
+        return false;
+    }
+    let Ok(frame) = zstd::stream::encode_all(&buf[HEADER..], level) else {
+        // Compression failing is not a reason to fail the write; the
+        // uncompressed payload is still correct.
+        return false;
+    };
+    // 4 bytes of declared length ride along, so they count.
+    if frame.len() + 4 >= buf.len() - HEADER {
+        return false;
+    }
+
+    let plain_len = (buf.len() - HEADER) as u32;
+    buf.truncate(HEADER);
+    buf[1] |= FLAG_COMPRESSED;
+    buf.extend_from_slice(&plain_len.to_le_bytes());
+    buf.extend_from_slice(&frame);
+    true
 }
 
 #[cfg(test)]
@@ -515,7 +582,7 @@ mod tests {
         assert_eq!(
             hex(&buf),
             concat!(
-                "03 ",                                 // version
+                "03 00 ",                              // version, flags
                 "03 00 00 00 01 00 00 00 ",            // CREATE_NODE, count = 1
                 "00 01 00 ",                           // IdSet: raw, width 1, id 0
                 "01 00 07 00 00 00 ",                  // LabelSet: n = 1, label 7
@@ -534,10 +601,10 @@ mod tests {
         let mut buf = new_buffer();
         write_create_node(&mut buf, &ids, &[7], &[0], &rows);
 
-        assert_eq!(&buf[1..5], &Opcode::CreateNode.as_u32().to_le_bytes());
-        assert_eq!(&buf[5..9], &10_000_u32.to_le_bytes());
+        assert_eq!(&buf[2..6], &Opcode::CreateNode.as_u32().to_le_bytes());
+        assert_eq!(&buf[6..10], &10_000_u32.to_le_bytes());
         // 10,000 consecutive ids collapse to one roaring run.
-        assert_eq!(buf[9], BlockEncoding::Compressed.as_u8());
+        assert_eq!(buf[10], BlockEncoding::Compressed.as_u8());
 
         let records = read_buffer(&buf).unwrap();
         assert_eq!(records.len(), 1);
@@ -1112,15 +1179,106 @@ mod tests {
             &[0],
             &[Value::Int(1), Value::Int(2)],
         );
-        // From 2: a buffer of nothing but the version byte carries zero
-        // records, which is valid rather than truncated.
-        for cut in 2..buf.len() {
+        // From 3: a header with no records after it is a valid empty payload,
+        // not a truncated one.
+        for cut in 3..buf.len() {
             assert!(read_buffer(&buf[..cut]).is_err(), "cut at {cut}");
         }
     }
 
+    // ── the payload header ──
+
+    #[test]
+    fn the_flags_byte_is_reserved_even_though_nothing_sets_it() {
+        // Reserving it now is the point: adding a byte to the header later
+        // would cost another version bump for something compression needs.
+        let mut buf = new_buffer();
+        write_delete_node(&mut buf, &[1]);
+        assert_eq!(buf[0], EFFECTS_VERSION);
+        assert_eq!(buf[1], 0, "no flags by default");
+        assert_eq!(read_buffer(&buf).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn compression_round_trips_and_shrinks() {
+        // 10,000 nodes of one shape: highly repetitive, which is the case worth
+        // compressing at all.
+        let ids: Vec<u64> = (0..10_000).collect();
+        let rows: Vec<Value> = (0..10_000).map(|i| Value::Int(i as i64)).collect();
+        let mut buf = new_buffer();
+        write_create_node(&mut buf, &ids, &[7], &[0], &rows);
+        let plain = buf.clone();
+
+        assert!(maybe_compress(&mut buf, 1024, 1), "should compress");
+        assert_eq!(buf[0], EFFECTS_VERSION, "the header stays plaintext");
+        assert_eq!(buf[1], FLAG_COMPRESSED);
+        assert!(
+            buf.len() < plain.len() / 4,
+            "{} vs {}",
+            buf.len(),
+            plain.len()
+        );
+
+        // And it decodes to exactly what the uncompressed payload does.
+        assert_eq!(read_buffer(&buf).unwrap(), read_buffer(&plain).unwrap());
+    }
+
+    #[test]
+    fn compression_is_off_at_zero_and_declines_when_it_would_not_help() {
+        let mut buf = new_buffer();
+        write_create_node(&mut buf, &[0], &[7], &[0], &[Value::Int(1)]);
+        let before = buf.clone();
+
+        assert!(!maybe_compress(&mut buf, 0, 1), "0 disables it");
+        assert_eq!(buf, before);
+
+        // Enabled, but a 33-byte record is below any sane floor — and even
+        // forced, zstd inflates a payload this small, so the smaller form wins.
+        assert!(!maybe_compress(&mut buf, 1, 1));
+        assert_eq!(
+            buf, before,
+            "left uncompressed because compressing is bigger"
+        );
+    }
+
+    #[test]
+    fn an_unknown_flag_is_refused_rather_than_ignored() {
+        // An old node meeting a future payload must fail loudly. Decoding the
+        // records anyway would apply a prefix of something whose shape it does
+        // not know.
+        let mut buf = new_buffer();
+        write_delete_node(&mut buf, &[1]);
+        buf[1] = 0x80;
+        assert_eq!(read_buffer(&buf), Err(DecodeError::UnknownFlags(0x80)));
+    }
+
+    #[test]
+    fn a_corrupt_frame_is_an_error_not_a_panic() {
+        let ids: Vec<u64> = (0..2_000).collect();
+        let rows: Vec<Value> = (0..2_000).map(|i| Value::Int(i as i64)).collect();
+        let mut buf = new_buffer();
+        write_create_node(&mut buf, &ids, &[7], &[0], &rows);
+        assert!(maybe_compress(&mut buf, 16, 1));
+
+        // Truncating anywhere inside the frame must error, never panic.
+        for cut in 7..buf.len() {
+            assert!(read_buffer(&buf[..cut]).is_err(), "cut at {cut}");
+        }
+        // And a frame that expands to the wrong size is caught by the length.
+        let mut lied = buf.clone();
+        lied[2] = lied[2].wrapping_add(1);
+        assert!(matches!(
+            read_buffer(&lied),
+            Err(DecodeError::CompressedLengthMismatch { .. })
+        ));
+    }
+
     #[test]
     fn buffer_header_is_the_version() {
-        assert_eq!(new_buffer(), vec![3_u8]);
+        assert_eq!(
+            new_buffer(),
+            vec![3_u8, 0],
+            "version, then the reserved flags byte"
+        );
     }
 }

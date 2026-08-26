@@ -31,6 +31,12 @@ impl<'a> Reader<'a> {
         self.remaining() == 0
     }
 
+    /// Everything not yet consumed, without consuming it.
+    #[must_use]
+    pub fn rest(&self) -> &'a [u8] {
+        &self.buf[self.pos..]
+    }
+
     pub(super) fn take(
         &mut self,
         n: usize,

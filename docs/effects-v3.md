@@ -93,6 +93,48 @@ record to amortise a declaration over, so the reference bytes are pure addition
 proportionally large is one shape per node (10.3%), and there every shape is
 distinct, so a table cannot help at all.
 
+## The payload header
+
+    GRAPH.EFFECT <graph-key> <payload>
+
+      u8  version = 3
+      u8  flags                      bit 0 = compressed
+      u32 uncompressed_length        only when compressed
+      records… | zstd frame
+
+The header is never compressed, so a reader always knows what it holds before
+committing to decode anything.
+
+**The flags byte is reserved whether or not compression is on.** Adding a byte
+to the header later would cost another version bump for something compression
+needs, which is the whole reason it is here from the start rather than when the
+feature is first switched on.
+
+A reader that meets a flag bit outside the mask it understands **rejects the
+buffer**. An old node meeting a future payload must fail loudly; decoding the
+records anyway would apply a prefix of something whose shape it does not know.
+The declared uncompressed length is checked against what the frame actually
+expands to, for the same reason: a mismatch means header and payload disagree.
+
+### Compression is default off
+
+`GRAPH.CONFIG SET EFFECTS_COMPRESSION <bytes>` — the smallest payload worth
+compressing; **0, the default, disables it**. zstd level 1.
+
+Off by default because compression is a bandwidth trade, not a CPU one: measured
+at 3.245 cycles/byte to compress against 0.067 to copy into the replica output
+buffer, so on a fast link it spends far more than the bytes are worth. Worth
+turning on when the replication link, rather than the write thread, is the
+constraint.
+
+Even when enabled the smaller form wins — zstd inflates an already-minimal
+buffer, and batched records are already most of the way there. On the motivating
+query the three sizes are **340,001 B (v2) → 120,052 B (v3) → 8,582 B
+(v3 + zstd-1)**.
+
+Compression runs last, after the record stream is complete, because it rewrites
+everything after the header.
+
 ## Design rule
 
 **Every batchable record is `u32 opcode · u32 count · blocks…`, built from five
@@ -577,6 +619,9 @@ Two module instances, one replicating from the other, 2026-08-26:
 - Master and replica agreed exactly afterwards: 988 nodes, 987 `:Person`, 65
   `:Young`, 1 `:Later`, and matching property values — across creates, a label
   set, a delete, and the v2 write that followed.
+- With `EFFECTS_COMPRESSION 1024`, a 5,000-node create reached the replica as
+  `\x03` `\x01` then the length `0x0002460e` and a frame beginning `28 b5 2f fd`
+  — zstd's magic number — and the two sides again agreed exactly.
 
 ## Verification
 
