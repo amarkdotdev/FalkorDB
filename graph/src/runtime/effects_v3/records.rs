@@ -483,6 +483,116 @@ fn read_singular(
     })
 }
 
+/// Write one record, whatever its opcode.
+fn write_record(
+    buf: &mut Vec<u8>,
+    record: &Record,
+) {
+    match record {
+        Record::AddSchema {
+            schema_type,
+            id,
+            name,
+        } => write_add_schema(buf, *schema_type, *id, name),
+        Record::AddAttribute { id, name } => write_add_attribute(buf, *id, name),
+        Record::CreateNode {
+            ids,
+            labels,
+            attr_ids,
+            rows,
+        } => write_create_node(buf, ids, labels, attr_ids, rows),
+        Record::CreateEdge {
+            ids,
+            relation_id,
+            src,
+            dst,
+            attr_ids,
+            rows,
+        } => write_create_edge(buf, ids, *relation_id, src, dst, attr_ids, rows),
+        Record::Update {
+            entity,
+            ids,
+            attr_ids,
+            rows,
+        } => write_update(buf, *entity, ids, attr_ids, rows),
+        Record::Labels { add, ids, labels } => write_labels(buf, *add, ids, labels),
+        Record::DeleteNode { ids } => write_delete_node(buf, ids),
+        Record::DeleteEdge {
+            ids,
+            relation_id,
+            src,
+            dst,
+        } => write_delete_edge(buf, ids, *relation_id, src, dst),
+        Record::Index {
+            create,
+            schema_type,
+            label_id,
+            label,
+            attr_id,
+            attr,
+            field_type,
+            options,
+        } => {
+            let field = IndexField {
+                attr_id: *attr_id,
+                attr,
+                field_type: *field_type,
+            };
+            if *create {
+                write_create_index(
+                    buf,
+                    *schema_type,
+                    *label_id,
+                    label,
+                    field,
+                    options.as_ref().unwrap_or(&Value::Null),
+                );
+            } else {
+                write_drop_index(buf, *schema_type, *label_id, label, field);
+            }
+        }
+        Record::Constraint {
+            create,
+            constraint_type,
+            entity_type,
+            label_id,
+            label,
+            props,
+        } => {
+            let props: Vec<(u16, &str)> = props.iter().map(|(i, n)| (*i, n.as_str())).collect();
+            write_constraint(
+                buf,
+                *create,
+                *constraint_type,
+                *entity_type,
+                *label_id,
+                label,
+                &props,
+            );
+        }
+    }
+}
+
+/// The effects encoding of one record.
+///
+/// `encode` is total — every variant has a shape — while `decode` reads the
+/// opcode first and dispatches, so the pair is not symmetric in signature even
+/// though it is in effect.
+impl EffectEncode<3> for Record {
+    fn encode(
+        &self,
+        buf: &mut Vec<u8>,
+    ) {
+        write_record(buf, self);
+    }
+}
+
+impl EffectDecode<3> for Record {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        read_record(r)
+    }
+}
+
 /// Read a whole `GRAPH.EFFECT` payload: the header, then every record.
 ///
 /// One command carries one payload carries many records — batching removes
@@ -523,7 +633,7 @@ fn read_records(buf: &[u8]) -> Result<Vec<Record>, DecodeError> {
     let mut r = Reader::new(buf);
     let mut records = Vec::new();
     while !r.is_empty() {
-        records.push(read_record(&mut r)?);
+        records.push(<Record as EffectDecode<3>>::decode(&mut r)?);
     }
     Ok(records)
 }

@@ -24,7 +24,7 @@ use rustc_hash::FxHashMap;
 use crate::{
     graph::graph::Graph,
     runtime::{
-        effects_v3::{self as v3, GraphEntity, Record, SchemaType},
+        effects_v3::{self as v3, EffectEncode, GraphEntity, Record, SchemaType},
         pending::Pending,
         value::Value,
     },
@@ -44,7 +44,7 @@ pub fn build_effects_buffer_v3(
     }
     let mut n = 0;
     for record in digest(p, g) {
-        encode(buf, &record);
+        record.encode(buf);
         n += 1;
     }
     n
@@ -130,96 +130,6 @@ pub fn digest(
         });
     }
     out
-}
-
-/// Write one record.
-fn encode(
-    buf: &mut Vec<u8>,
-    record: &Record,
-) {
-    match record {
-        Record::AddSchema {
-            schema_type,
-            id,
-            name,
-        } => v3::write_add_schema(buf, *schema_type, *id, name),
-        Record::AddAttribute { id, name } => v3::write_add_attribute(buf, *id, name),
-        Record::CreateNode {
-            ids,
-            labels,
-            attr_ids,
-            rows,
-        } => v3::write_create_node(buf, ids, labels, attr_ids, rows),
-        Record::CreateEdge {
-            ids,
-            relation_id,
-            src,
-            dst,
-            attr_ids,
-            rows,
-        } => v3::write_create_edge(buf, ids, *relation_id, src, dst, attr_ids, rows),
-        Record::Update {
-            entity,
-            ids,
-            attr_ids,
-            rows,
-        } => v3::write_update(buf, *entity, ids, attr_ids, rows),
-        Record::Labels { add, ids, labels } => v3::write_labels(buf, *add, ids, labels),
-        Record::DeleteNode { ids } => v3::write_delete_node(buf, ids),
-        Record::DeleteEdge {
-            ids,
-            relation_id,
-            src,
-            dst,
-        } => v3::write_delete_edge(buf, ids, *relation_id, src, dst),
-        Record::Index {
-            create,
-            schema_type,
-            label_id,
-            label,
-            attr_id,
-            attr,
-            field_type,
-            options,
-        } => {
-            let field = v3::IndexField {
-                attr_id: *attr_id,
-                attr,
-                field_type: *field_type,
-            };
-            if *create {
-                v3::write_create_index(
-                    buf,
-                    *schema_type,
-                    *label_id,
-                    label,
-                    field,
-                    options.as_ref().unwrap_or(&Value::Null),
-                );
-            } else {
-                v3::write_drop_index(buf, *schema_type, *label_id, label, field);
-            }
-        }
-        Record::Constraint {
-            create,
-            constraint_type,
-            entity_type,
-            label_id,
-            label,
-            props,
-        } => {
-            let props: Vec<(u16, &str)> = props.iter().map(|(i, n)| (*i, n.as_str())).collect();
-            v3::write_constraint(
-                buf,
-                *create,
-                *constraint_type,
-                *entity_type,
-                *label_id,
-                label,
-                &props,
-            );
-        }
-    }
 }
 
 fn digest_created_nodes(

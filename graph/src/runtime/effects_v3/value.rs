@@ -10,9 +10,9 @@ use crate::runtime::{
 };
 
 use super::{
-    DecodeError, Reader, T_ARRAY, T_BOOL, T_DATE, T_DATETIME, T_DOUBLE, T_DURATION, T_INT64, T_MAP,
-    T_NULL, T_POINT, T_STRING, T_TIME, T_VECTOR_F32, write_f64, write_i64, write_string, write_u8,
-    write_u32,
+    DecodeError, EffectDecode, EffectEncode, Reader, T_ARRAY, T_BOOL, T_DATE, T_DATETIME, T_DOUBLE,
+    T_DURATION, T_INT64, T_MAP, T_NULL, T_POINT, T_STRING, T_TIME, T_VECTOR_F32, write_f64,
+    write_i64, write_string, write_u8, write_u32,
 };
 
 // ── SIValue ──
@@ -227,5 +227,27 @@ mod tests {
         let buf = 0x0000_0002_u32.to_le_bytes();
         let mut r = Reader::new(&buf);
         assert_eq!(read_value(&mut r), Err(DecodeError::BadValueType(2)));
+    }
+}
+
+/// The effects encoding of a `SIValue`.
+///
+/// `Value` already carries `Encode<19>` for the RDB path; this is the same type
+/// on a different wire, and the two disagree in every way that matters — RDB
+/// writes tags through a variable-width `write_unsigned`, effects write a fixed
+/// 4 bytes. Keeping them as separate trait impls is what stops one being
+/// mistaken for the other.
+impl EffectEncode<3> for Value {
+    fn encode(
+        &self,
+        buf: &mut Vec<u8>,
+    ) {
+        write_value(buf, self);
+    }
+}
+
+impl EffectDecode<3> for Value {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        read_value(r)
     }
 }

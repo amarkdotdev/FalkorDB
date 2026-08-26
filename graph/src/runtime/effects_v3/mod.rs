@@ -362,6 +362,35 @@ si_tags!(
 /// unlike the rest it is stated here.
 pub const T_MAP: u32 = 1 << 0;
 
+// ── the codec traits ──
+
+/// Types that can write themselves into an effects payload of a given version.
+///
+/// Mirrors `serialization::Encode<VERSION>` on the RDB side, and for the same
+/// reason: the version belongs in the type system rather than in a module name,
+/// so a v4 lands as `impl EffectEncode<4> for Record` beside this one and the
+/// compiler picks between them.
+///
+/// The unit is a whole [`Record`]. Blocks stay free functions because they are
+/// sized by the record's `count`, which a `&self` encoder has no way to carry —
+/// the same reason the RDB traits grow `encode_with_range` / `decode_with_count`
+/// rather than folding counts into `encode`.
+pub trait EffectEncode<const VERSION: u8> {
+    fn encode(
+        &self,
+        buf: &mut Vec<u8>,
+    );
+}
+
+/// Types that can read themselves out of an effects payload of a given version.
+pub trait EffectDecode<const VERSION: u8>: Sized {
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] if the bytes are malformed, truncated, or
+    /// describe a shape this version does not have.
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError>;
+}
+
 // ── payload header ──
 
 /// The payload is a zstd frame, not records.
