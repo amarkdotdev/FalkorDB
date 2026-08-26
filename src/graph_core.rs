@@ -1541,6 +1541,14 @@ pub fn process_write_queued_query(graph: &Arc<RwLock<ThreadedGraph>>) {
 /// Decide whether to use effects replication and get the pre-built buffer.
 /// The buffer was built in `CommitOp` before pending was cleared.
 /// Returns Some(buffer) if effects should be sent, None for verbatim replication.
+/// Bytes of header before the first record, for whichever version wrote `buf`.
+fn header_len(buf: &[u8]) -> usize {
+    match buf.first() {
+        Some(&v) if v >= graph::effects::v3::EFFECTS_VERSION => 2,
+        _ => 1,
+    }
+}
+
 pub(crate) fn should_use_effects(
     is_non_deterministic: bool,
     runtime: &Runtime,
@@ -1550,7 +1558,10 @@ pub(crate) fn should_use_effects(
 
     let buf = runtime.effects_buffer.borrow_mut().take();
     let buf = match buf {
-        Some(b) if b.len() > 1 => b, // > 1 because version byte alone means empty
+        // A payload holding nothing but its header carries no records. The
+        // header is one byte in v2 and two in v3 — the flags byte — so this
+        // cannot be a constant.
+        Some(b) if b.len() > header_len(&b) => b,
         _ => return None,
     };
 

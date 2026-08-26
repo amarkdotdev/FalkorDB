@@ -607,85 +607,54 @@ v2 has no standalone decoder to compare against — its bytes are read and appli
 to a `Graph` in one pass, in the root crate — so this is v3 only. Decompression
 adds 12–25%.
 
-### Query execution, live
+### Both sides of the link, in instructions
 
-Master and replica, `EFFECTS_THRESHOLD 0`, best of three after a warmup,
-`GRAPH.QUERY` internal execution time:
+Wall-clock could not answer this. Measuring the modes in sequence drifted far
+enough that a master with **no replica** read slower than one replicating v2 —
+impossible, and the tell that the window was dirty. `proc_pid_rusage` gives a
+running instruction total per pid and does not drift; the bench harness already
+has the reader (`falkorbench.counters.read_rusage`), so this borrows it.
 
-| nodes | v2 | v3 | |
-| --- | --- | --- | --- |
-| 1 | 0.033 ms | 0.034 ms | 1.03× |
-| 100 | 0.064 ms | 0.079 ms | 1.23× |
-| 1,000 | 0.381 ms | 0.456 ms | 1.20× |
-| 10,000 | 2.973 ms | 3.494 ms | 1.18× |
-| 100,000 | 28.933 ms | 41.011 ms | **1.42×** |
+Four modes, because "no replication" and "verbatim" are different things. `none`
+runs on a server that never has a replica attached, so `build_effects` is false
+and nothing is built. Millions of instructions, best of three:
 
-The encode cost shows up in query latency, at roughly a fifth for mid-size
-writes and 42% at 100,000 nodes. The replica agreed with the master on every
-run, under both formats.
+| nodes | mode | master | replica | total | vs none |
+| --- | --- | --- | --- | --- | --- |
+| 1,000 | none | 16.9 | — | 16.9 | 1.00× |
+| | verbatim | 23.4 | 20.4 | 43.9 | 2.60× |
+| | v2 | 23.5 | 27.4 | 50.9 | 3.02× |
+| | **v3** | 25.6 | **17.7** | **43.3** | **2.57×** |
+| 10,000 | none | 91.8 | — | 91.8 | 1.00× |
+| | verbatim | 123.7 | 98.6 | 222.3 | 2.42× |
+| | v2 | 103.7 | 167.9 | 271.6 | 2.96× |
+| | **v3** | 124.2 | **77.6** | **201.9** | **2.20×** |
+| 100,000 | none | 813.6 | — | 813.6 | 1.00× |
+| | verbatim | 1052.0 | 866.0 | 1918.0 | 2.36× |
+| | v2 | 882.0 | 1645.8 | 2527.8 | 3.11× |
+| | **v3** | 1054.9 | **662.7** | **1717.7** | **2.11×** |
 
-**This is the trade to argue about**, and it is not obviously worth taking on a
-fast link: v3 costs measurable write latency to save ~28% of a payload that
-replicates asynchronously. It becomes clearly worth it when compression is on
-(0.6% of v2 at a million nodes) or when the link, rather than the write thread,
-is the constraint. Nothing here is a reason to move the `EFFECTS_VERSION`
-default; the reason for v3 is that two engines can read it.
+**The replica is where v3 pays.** At 100,000 nodes it applies in 662.7 M
+instructions against v2's 1,645.8 M — **2.5× cheaper** — because a record covers
+every entity of its shape and lands as one bulk graph operation rather than one
+per entity. It is also below verbatim's 866.0 M, where the replica re-executes
+the query in full.
 
-### Records are streamed in both directions
+**On the master v3 costs about 20% more than v2** (1054.9 against 882.0), which
+is the encode cost the criterion figures above show directly. Whole-system, v3 is
+**32% cheaper than v2 and 10% cheaper than verbatim**.
 
-Neither side materializes a record list. Emit hands each record to a sink as it
-is built (`for_each_record`); apply decodes one, applies it, and drops it. The
-collecting forms — `digest` and `read_buffer` — remain for tests and for
-comparing two payloads, and are built on the streaming ones.
+This is the correction to the query-latency figures: those measure the master
+only, where v3 *is* slower, and stopping there gets the sign of the whole trade
+wrong.
 
-Emit, measured (`-- encode_shape`):
-
-| records | payload | collect | stream | |
-| --- | --- | --- | --- | --- |
-| 1,000 | 1 record | 57.9 µs | 55.3 µs | −4.5% |
-| 1,000 | N records | 182 µs | 181 µs | −0.6% |
-| 10,000 | 1 record | 522 µs | 507 µs | −2.9% |
-| 10,000 | N records | 1.94 ms | 1.94 ms | −0.1% |
-| 100,000 | 1 record | 6.36 ms | 6.09 ms | −4.2% |
-| 100,000 | N records | 20.3 ms | 18.7 ms | **−7.6%** |
-
-Smaller than the decode gain, because emit was already dominated by building the
-group maps and cloning row values — dropping the record vector removes an
-allocation and a walk, not the bulk of the work. It is still on the GIL-holding
-write thread, which is where the cheapest wins are worth taking.
-
-### Records are applied as they are decoded
-
-The apply path decodes one record, applies it, and drops it, rather than
-materializing every record and then walking them. `open_payload` consumes the
-header and hands back a `Records` stream; a compressed payload is still inflated
-whole first, because a zstd frame cannot be read in pieces.
-
-`Records` is deliberately **not** an `Iterator`. `next` returning `None` for
-"malformed" is exactly the mistake that applies a prefix of a corrupt buffer, so
-`next_record` returns `Option<Result<..>>` and a decode failure stops the caller.
-
-Measured (`cargo bench -p graph --bench effects_versions -- decode_shape`):
-
-| records | payload | materialize | stream | |
-| --- | --- | --- | --- | --- |
-| 1,000 | 1 record | 38.5 µs | 37.5 µs | −2.8% |
-| 1,000 | N records | 55.6 µs | 52.0 µs | −6.5% |
-| 10,000 | 1 record | 393 µs | 396 µs | +0.8% |
-| 10,000 | N records | 587 µs | 514 µs | **−12.4%** |
-| 100,000 | 1 record | 4.05 ms | 4.01 ms | −1.0% |
-| 100,000 | N records | 4.55 ms | 3.59 ms | **−21.1%** |
-
-The gain tracks record count, not node count, which is what the two payload
-shapes separate: one record covering N nodes has nothing to stream, while N
-singleton records had N decoded records live at once and their memory walked
-twice. At one record the difference is inside the noise in both directions.
-
-**The more robust win is the bound, not the percentage.** Live decoded state is
-now one record whatever the payload holds, where it was proportional to the
-record count. And this measures *decode*, which is a fraction of what a replica
-spends — the graph mutations dominate — so the end-to-end effect on replica
-apply is smaller than these figures.
+**Verbatim does not save the master any encoding work.** `build_effects` is set
+from replica presence alone (`graph_core.rs:686`); `should_use_effects` consults
+`EFFECTS_THRESHOLD` only afterwards, on a buffer that has already been built. A
+query that replicates verbatim therefore pays to construct a payload it then
+discards — visible above as verbatim's master cost sitting level with v3's
+(1052.0 against 1054.9) rather than near the 813.6 baseline. The threshold saves
+network and replica work, not master CPU. Worth fixing independently of v3.
 
 ## Migration and rollout
 
