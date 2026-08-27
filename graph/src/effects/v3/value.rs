@@ -233,10 +233,13 @@ mod tests {
 /// The effects encoding of a `SIValue`.
 ///
 /// `Value` already carries `Encode<19>` for the RDB path; this is the same type
-/// on a different wire, and the two disagree in every way that matters — RDB
-/// writes tags through a variable-width `write_unsigned`, effects write a fixed
-/// 4 bytes. Keeping them as separate trait impls is what stops one being
-/// mistaken for the other.
+/// on a different wire, and the two disagree in every way that matters. The RDB
+/// stream is self-describing: `write_unsigned` emits a `TYPE_UNSIGNED` byte and
+/// a fixed 8-byte LE value, so a tag costs 9 bytes there and 4 here, and every
+/// field behind it is framed differently too — bool as a tagged i64 vs one byte,
+/// point as two f64 vs two f32, list counts tagged vs a bare `u32`. RDB also
+/// cannot represent a map at all. Keeping them as separate trait impls is what
+/// stops one being mistaken for the other.
 impl EffectEncode<3> for Value {
     fn encode(
         &self,

@@ -328,9 +328,9 @@ impl TryFrom<u8> for BlockEncoding {
 // Derived from `serialization::si_type` rather than restated: the RDB encoder
 // already carries C's tags, and two copies of a bitmask would drift silently —
 // nothing fails when a tag is wrong, the far side just reads the next field as
-// a type. They are `u64` there because RDB writes them through a
-// variable-width `write_unsigned`; the effects wire is a fixed 4 bytes, so
-// these narrow.
+// a type. They are `u64` there because RDB writes them through
+// `write_unsigned`, which emits a type byte plus a fixed 8-byte LE value; the
+// effects wire is a bare 4 bytes, so these narrow.
 //
 // C's `SIType` is a **bitmask**, not an ordinal: each type is a distinct bit.
 // Rust's own v2 codec used sequential 0..12 tags, which collide with these
